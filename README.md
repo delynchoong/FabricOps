@@ -11,7 +11,7 @@ using them outside a development environment.
 
 | Project | Description |
 | --- | --- |
-| [TickPOC](TickPOC/README.md) | C++ Apache Avro stock-ticker generator with selectable Eventhouse streaming and queued ingestion. |
+| [EventhouseKustoIngest](EventhouseKustoIngest/README.md) | C++ Apache Avro stock-ticker generator with selectable Eventhouse streaming and queued ingestion. |
 | [NYC Taxi Medallion](NYC_Taxi_Medallion/README.md) | Bronze, Silver, and Gold lakehouse architecture using NYC TLC taxi data, Fabric notebooks, pipelines, Direct Lake, and Power BI. |
 
 ## Authentication

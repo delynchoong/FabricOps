@@ -1,5 +1,5 @@
 #include "environment_config.h"
-#include "stock_tick_producer.h"
+#include "stock_tick_ingestion.h"
 
 #include <cstdlib>
 #include <exception>
@@ -16,19 +16,23 @@ int main(int argc, char* argv[]) {
             configured_env_file == nullptr ? ".env" : configured_env_file,
             configured_env_file != nullptr);
 
-        const tickpoc::IngestConfig config{
-            .streaming_ingest_uri =
+        const tickpoc::StreamingIngestConfig config{
+            .query_uri =
                 tickpoc::require_environment_variable("KUSTO_QUERY_URI"),
-            .database =
-                tickpoc::require_environment_variable("KUSTO_DATABASE"),
-            .table = tickpoc::require_environment_variable("KUSTO_TABLE"),
-            .mapping = tickpoc::require_environment_variable("KUSTO_MAPPING"),
+            .target = {
+                .database =
+                    tickpoc::require_environment_variable("KUSTO_DATABASE"),
+                .table =
+                    tickpoc::require_environment_variable("KUSTO_TABLE"),
+                .mapping =
+                    tickpoc::require_environment_variable("KUSTO_MAPPING"),
+            },
         };
         const std::string token =
             tickpoc::require_environment_variable("KUSTO_ACCESS_TOKEN");
 
         const auto event = tickpoc::make_stock_tick(ticker, price);
-        tickpoc::ingest_stock_tick_avro(event, config, token);
+        tickpoc::ingest_stock_tick_streaming(event, config, token);
 
         std::cout << "Ingested " << event.ticker << " at " << event.price
                   << '\n';

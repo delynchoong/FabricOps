@@ -1,6 +1,5 @@
 #include "environment_config.h"
-#include "queued_ingestion.h"
-#include "stock_tick_producer.h"
+#include "stock_tick_ingestion.h"
 
 #include <algorithm>
 #include <array>
@@ -122,24 +121,25 @@ int main(int argc, char* argv[]) {
         std::mt19937_64 random(std::random_device{}());
         std::signal(SIGINT, handle_signal);
 
-        const tickpoc::IngestConfig streaming_config{
-            .streaming_ingest_uri =
-                options.mode == "streaming"
-                    ? tickpoc::require_environment_variable("KUSTO_QUERY_URI")
-                    : std::string{},
+        const tickpoc::IngestionTarget target{
             .database =
                 tickpoc::require_environment_variable("KUSTO_DATABASE"),
             .table = tickpoc::require_environment_variable("KUSTO_TABLE"),
             .mapping = tickpoc::require_environment_variable("KUSTO_MAPPING"),
         };
+        const tickpoc::StreamingIngestConfig streaming_config{
+            .query_uri =
+                options.mode == "streaming"
+                    ? tickpoc::require_environment_variable("KUSTO_QUERY_URI")
+                    : std::string{},
+            .target = target,
+        };
         const tickpoc::QueuedIngestConfig queued_config{
-            .ingest_uri =
+            .ingestion_uri =
                 options.mode == "queued"
                     ? tickpoc::require_environment_variable("KUSTO_INGEST_URI")
                     : std::string{},
-            .database = streaming_config.database,
-            .table = streaming_config.table,
-            .mapping = streaming_config.mapping,
+            .target = target,
         };
 
         const auto started = std::chrono::steady_clock::now();
@@ -156,10 +156,11 @@ int main(int argc, char* argv[]) {
             const auto events =
                 generate_batch(tickers, options.rate, random);
             if (options.mode == "streaming") {
-                tickpoc::ingest_stock_ticks_avro(
+                tickpoc::ingest_stock_ticks_streaming(
                     events, streaming_config, token);
             } else {
-                const std::string operation = tickpoc::queue_stock_ticks_avro(
+                const std::string operation =
+                    tickpoc::ingest_stock_ticks_queued(
                     events, queued_config, token);
                 std::cout << "Queued operation " << operation << ": ";
             }

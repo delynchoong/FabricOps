@@ -1,5 +1,5 @@
 {
-  "name": "tick-poc-producer",
+  "name": "eventhouse-kusto-ingest",
   "version-string": "0.1.0",
   "dependencies": [
     "avro-cpp",

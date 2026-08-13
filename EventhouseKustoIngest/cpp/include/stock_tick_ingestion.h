@@ -15,11 +15,21 @@ struct StockTick {
     std::string eventdesc;
 };
 
-struct IngestConfig {
-    std::string streaming_ingest_uri;
+struct IngestionTarget {
     std::string database;
     std::string table;
     std::string mapping;
+};
+
+struct StreamingIngestConfig {
+    // Kusto hosts the streaming REST endpoint on the query service URI.
+    std::string query_uri;
+    IngestionTarget target;
+};
+
+struct QueuedIngestConfig {
+    std::string ingestion_uri;
+    IngestionTarget target;
 };
 
 StockTick make_stock_tick(
@@ -28,17 +38,19 @@ StockTick make_stock_tick(
     std::chrono::system_clock::time_point event_time =
         std::chrono::system_clock::now());
 
-void ingest_stock_tick_avro(
+void ingest_stock_tick_streaming(
     const StockTick& tick,
-    const IngestConfig& config,
+    const StreamingIngestConfig& config,
     const std::string& bearer_token);
 
-std::vector<char> serialize_stock_ticks_avro(
-    const std::vector<StockTick>& ticks);
-
-void ingest_stock_ticks_avro(
+void ingest_stock_ticks_streaming(
     const std::vector<StockTick>& ticks,
-    const IngestConfig& config,
+    const StreamingIngestConfig& config,
+    const std::string& bearer_token);
+
+std::string ingest_stock_ticks_queued(
+    const std::vector<StockTick>& ticks,
+    const QueuedIngestConfig& config,
     const std::string& bearer_token);
 
 }  // namespace tickpoc

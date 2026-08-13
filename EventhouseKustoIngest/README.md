@@ -1,6 +1,6 @@
-# TickPOC
+# EventhouseKustoIngest
 
-TickPOC generates simulated stock-ticker events and ingests them into a
+EventhouseKustoIngest generates simulated stock-ticker events and ingests them into a
 Microsoft Fabric Eventhouse configured through local environment variables.
 
 The generator uses five ticker symbols:
@@ -47,7 +47,7 @@ Open PowerShell from the repository root and set the project paths:
 
 ```powershell
 $repositoryRoot = (Get-Location).Path
-$project = Join-Path $repositoryRoot "TickPOC\cpp"
+$project = Join-Path $repositoryRoot "EventhouseKustoIngest\cpp"
 $vcpkgRoot = Join-Path $env:USERPROFILE "vcpkg"
 $cmake = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
 ```
@@ -74,7 +74,7 @@ Compile:
 The generator is created at:
 
 ```text
-TickPOC\cpp\build-x64\Release\stock_ticker_generator.exe
+EventhouseKustoIngest\cpp\build-x64\Release\stock_ticker_generator.exe
 ```
 
 After changing the source, only the compile command normally needs to be run
@@ -126,6 +126,20 @@ Streaming mode sends each one-second batch directly to the Eventhouse query
 service streaming-ingestion endpoint. This mode provides the lowest ingestion
 latency.
 
+The endpoint is the documented Kusto streaming-ingestion REST API:
+
+```http
+POST {KUSTO_QUERY_URI}/v1/rest/ingest/{database}/{table}
+    ?streamFormat=Avro&mappingName={mapping}
+```
+
+Microsoft reference:
+<https://learn.microsoft.com/kusto/api/rest/streaming-ingest?view=microsoft-fabric>
+
+`KUSTO_QUERY_URI` is intentional: Kusto exposes this API on the query service
+URI, not the `ingest-` queued-ingestion service URI. Avro requires a pre-created
+mapping, so `KUSTO_MAPPING` is always included.
+
 Run continuously at 100 events per second:
 
 ```powershell
@@ -161,7 +175,7 @@ Run queued ingestion for 60 seconds at 200 events per second:
 & $exe --mode queued --rate 200 --duration 60 --env-file $envFile
 ```
 
-The queued implementation uses the preview endpoint documented at:
+The queued implementation uses the REST endpoint documented at:
 
 <https://learn.microsoft.com/kusto/management/data-ingestion/queued-ingest-use-http?view=microsoft-fabric>
 
@@ -169,6 +183,21 @@ It does not implement the lower-level Azure Storage Queue protocol described
 at:
 
 <https://learn.microsoft.com/kusto/api/netfx/kusto-ingest-client-rest?view=microsoft-fabric>
+
+## Engineering guidance
+
+- Use streaming ingestion when sub-second-to-few-second latency is required and
+  each table receives a relatively small stream.
+- Prefer queued ingestion for sustained high-volume feeds so Fabric can batch
+  work efficiently.
+- The sample accepts a delegated bearer token through the process environment.
+  Production services should use a managed identity or service principal and a
+  token provider that refreshes tokens before expiry.
+- The code deliberately does not retry streaming POST requests automatically.
+  Retrying after an ambiguous network failure can duplicate events. Add an
+  application event ID and deduplication policy before introducing retries.
+- Queued mode enables operation tracking and returns the operation ID, but this
+  sample does not poll ingestion status.
 
 ## Command-line options
 
@@ -234,7 +263,8 @@ StockTicks
 | `cpp/src/stock_ticker_generator.cpp` | Generates and schedules ticker events. |
 | `cpp/src/stock_tick_producer.cpp` | Serializes Avro and performs streaming ingestion. |
 | `cpp/src/queued_ingestion.cpp` | Uploads Avro and submits queued ingestion. |
+| `cpp/src/http_client.cpp` | Shared cURL lifecycle, request, URL, and request-ID helpers. |
 | `cpp/src/environment_config.cpp` | Loads ignored local environment configuration. |
-| `cpp/include/stock_tick_producer.h` | Streaming producer interface. |
-| `cpp/include/queued_ingestion.h` | Queued producer interface. |
+| `cpp/include/stock_tick_ingestion.h` | Unified public model and streaming/queued ingestion interface. |
+| `cpp/tests/stock_tick_ingestion_tests.cpp` | Validates events, input guards, and Avro container output. |
 | `cpp/src/main.cpp` | Single-event demonstration executable. |
