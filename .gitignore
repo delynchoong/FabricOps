@@ -1,0 +1,34 @@
+# CMake and compiler output
+build/
+build-*/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.sln
+*.vcxproj*
+*.obj
+*.lib
+*.dll
+*.exe
+*.pdb
+
+# vcpkg
+vcpkg_installed/
+
+# IDE and operating-system files
+.vs/
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+
+# Local credentials and tokens
+.env
+.env.*
+!.env.example
+*.token
+*token_cache*
+fabric_msal_cache.bin

@@ -1,0 +1,9 @@
+{
+  "name": "tick-poc-producer",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "avro-cpp",
+    "curl",
+    "nlohmann-json"
+  ]
+}

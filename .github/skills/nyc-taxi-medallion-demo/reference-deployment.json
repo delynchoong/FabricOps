@@ -1,0 +1,66 @@
+{
+  "solution": "NYC Taxi Medallion Demo",
+  "deployedAt": "<deployment-date>",
+  "capacity": {
+    "name": "<capacity-name>",
+    "resourceGroup": "<resource-group-name>",
+    "sku": "F2",
+    "location": "<region>",
+    "fabricId": "<discover-dynamically>"
+  },
+  "workspace": {
+    "displayName": "<workspace-name>",
+    "id": "<discover-dynamically>"
+  },
+  "lakehouse": {
+    "displayName": "nyc_taxi_lakehouse",
+    "id": "<discover-dynamically>",
+    "schemas": [
+      "bronze",
+      "silver",
+      "gold"
+    ]
+  },
+  "notebooks": [
+    {
+      "displayName": "01_bronze_ingest",
+      "id": "<discover-dynamically>"
+    },
+    {
+      "displayName": "02_silver_transform",
+      "id": "<discover-dynamically>"
+    },
+    {
+      "displayName": "03_gold_aggregate",
+      "id": "<discover-dynamically>"
+    }
+  ],
+  "pipeline": {
+    "displayName": "NYC_Taxi_Medallion_Pipeline",
+    "id": "<discover-dynamically>",
+    "verifiedJobId": "<store-outside-source-control>",
+    "status": "Completed"
+  },
+  "semanticModel": {
+    "displayName": "NYC Taxi Analytics",
+    "id": "<discover-dynamically>",
+    "storageMode": "DirectLake"
+  },
+  "report": {
+    "displayName": "NYC Taxi Workshop",
+    "id": "<discover-dynamically>",
+    "pbirValidationErrors": 0,
+    "pbirValidationWarnings": 0
+  },
+  "verifiedResults": {
+    "bronzeTrips": 2964624,
+    "silverValidTrips": 2713898,
+    "silverRejectedTrips": 250726,
+    "goldActivityRows": 3810,
+    "goldDailyRows": 31,
+    "totalRevenue": 74270000,
+    "averageFare": 18.4,
+    "averageTripDistanceMiles": 3.3,
+    "tipRate": 0.189
+  }
+}
