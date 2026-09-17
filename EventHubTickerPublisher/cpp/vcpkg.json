@@ -1,0 +1,9 @@
+{
+  "name": "eventhub-ticker-publisher",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "avro-cpp",
+    "azure-identity-cpp",
+    "azure-messaging-eventhubs-cpp"
+  ]
+}
