@@ -28,8 +28,21 @@
 #include <utility>
 #include <vector>
 
+// End-to-end flow:
+//   1. Generate a StockTick C++ object.
+//   2. Serialize it as a one-record Avro Object Container File (OCF).
+//   3. Put those OCF bytes in one EventData message.
+//   4. Group independent EventData messages into an Event Hubs transport batch.
+//   5. Send with Microsoft Entra authentication through DefaultAzureCredential.
+//
+// The distinction between an Avro container and an EventDataBatch matters:
+// every EventData body remains a self-contained Avro document that Eventhouse
+// can decode independently; the EventDataBatch only reduces network calls.
+
 namespace sample {
 
+// The member order must match the field order used by codec_traits below.
+// eventtime stores Unix epoch milliseconds to match Avro timestamp-millis.
 struct StockTick {
     std::string eventname;
     std::int64_t eventtime;
@@ -68,6 +81,10 @@ struct codec_traits<sample::StockTick> {
 namespace {
 
 constexpr std::string_view kSchemaName = "sample.StockTick";
+
+// The writer schema is embedded in every OCF payload. That makes each EventData
+// self-describing, which is required by the validated direct Eventhouse Avro
+// ingestion path used by this sample.
 constexpr const char* kAvroSchema = R"({
   "type": "record",
   "name": "StockTick",
@@ -88,6 +105,8 @@ struct TickerState {
 };
 
 struct Options {
+    // count is the total number of EventData messages, while batch_size limits
+    // how many independent messages are grouped into each service send.
     int count = 10;
     int batch_size = 1;
     int interval_ms = 100;
@@ -150,6 +169,8 @@ Options parse_options(int argc, char* argv[]) {
 }
 
 const avro::ValidSchema& stock_tick_schema() {
+    // Function-local static initialization is thread-safe in C++11 and later,
+    // so the JSON schema is compiled only once for the process.
     static const avro::ValidSchema schema = [] {
         std::istringstream stream(kAvroSchema);
         avro::ValidSchema compiled;
@@ -181,6 +202,9 @@ std::vector<std::uint8_t> serialize_avro_container(
 
 sample::StockTick deserialize_avro_container(
     const std::vector<std::uint8_t>& payload) {
+    // OCF payloads start with the four-byte magic value "Obj" followed by 0x01.
+    // A raw Avro datum has no such header and the direct Eventhouse connector
+    // rejects it because it cannot discover the writer schema.
     constexpr std::array<std::uint8_t, 4> magic = {'O', 'b', 'j', 1};
     if (payload.size() < magic.size() ||
         !std::equal(magic.begin(), magic.end(), payload.begin())) {
@@ -210,6 +234,8 @@ sample::StockTick deserialize_avro_container(
 void validate_round_trip(
     const sample::StockTick& expected,
     const std::vector<std::uint8_t>& payload) {
+    // This is a publisher-side diagnostic, not part of normal delivery.
+    // It catches schema/codec mistakes before the bytes leave the process.
     const auto decoded = deserialize_avro_container(payload);
     if (decoded.eventname != expected.eventname ||
         decoded.eventtime != expected.eventtime ||
@@ -224,6 +250,8 @@ void validate_round_trip(
 sample::StockTick next_tick(
     std::array<TickerState, 5>& tickers,
     std::mt19937_64& random) {
+    // Apply a small random walk and constrain it to +/-10% of the starting
+    // price so long tests continue to produce plausible demonstration data.
     std::uniform_int_distribution<std::size_t> choose_ticker(
         0,
         tickers.size() - 1);
@@ -259,6 +287,10 @@ Azure::Messaging::EventHubs::Models::EventData make_event(
     // metadata and does not perform Avro serialization.
     event.Body = std::move(payload);
     event.ContentType = "avro/binary";
+
+    // MessageId and application properties are AMQP metadata. They are useful
+    // to consumers and diagnostics, but Eventhouse decodes Body according to
+    // the data connection's Avro format and ingestion mapping.
     event.MessageId = Azure::Core::Amqp::Models::AmqpValue(
         tick.ticker + "-" + std::to_string(tick.eventtime));
     event.Properties["avro.schema.name"] =
@@ -290,6 +322,9 @@ int main(int argc, char* argv[]) {
         const std::string event_hub_name =
             require_environment_variable("EVENTHUB_NAME");
 
+        // DefaultAzureCredential uses the Azure CLI login during local
+        // development and can use managed identity when hosted in Azure.
+        // The selected identity needs Azure Event Hubs Data Sender permission.
         Azure::Messaging::EventHubs::ProducerClient producer(
             fully_qualified_namespace,
             event_hub_name,
@@ -311,6 +346,9 @@ int main(int argc, char* argv[]) {
         auto batch = producer.CreateBatch();
         std::vector<PublishedEvent> batch_events;
         batch_events.reserve(static_cast<std::size_t>(options.batch_size));
+
+        // Keep logging state beside the SDK batch. ProducerClient::Send sends
+        // all EventData currently in the batch as one Event Hubs operation.
         const auto send_current_batch = [&] {
             producer.Send(batch);
             ++sent_batch_count;
@@ -347,6 +385,9 @@ int main(int argc, char* argv[]) {
             auto [event, payload_size] =
                 prepare_event(tick, options.validate_payload);
 
+            // TryAdd checks the encoded AMQP size against the service limit.
+            // A byte-full batch can therefore be sent before batch_size is
+            // reached. The rejected event is then retried in a fresh batch.
             if (!batch.TryAdd(event)) {
                 if (batch.NumberOfEvents() == 0) {
                     throw std::runtime_error(
