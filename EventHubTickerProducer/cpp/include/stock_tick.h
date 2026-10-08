@@ -35,19 +35,19 @@ std::vector<std::uint8_t> serialize_stock_tick_avro_raw(
 StockTick deserialize_stock_tick_avro_raw(
     const std::vector<std::uint8_t>& payload);
 
-class EventHubPublisher {
+class EventHubProducer {
 public:
-    EventHubPublisher(
+    EventHubProducer(
         std::string fully_qualified_namespace,
         std::string event_hub_name,
         AvroPayloadFormat payload_format =
             AvroPayloadFormat::ObjectContainer);
-    ~EventHubPublisher();
+    ~EventHubProducer();
 
-    EventHubPublisher(EventHubPublisher&&) noexcept;
-    EventHubPublisher& operator=(EventHubPublisher&&) noexcept;
-    EventHubPublisher(const EventHubPublisher&) = delete;
-    EventHubPublisher& operator=(const EventHubPublisher&) = delete;
+    EventHubProducer(EventHubProducer&&) noexcept;
+    EventHubProducer& operator=(EventHubProducer&&) noexcept;
+    EventHubProducer(const EventHubProducer&) = delete;
+    EventHubProducer& operator=(const EventHubProducer&) = delete;
 
     void publish(const std::vector<StockTick>& ticks);
 

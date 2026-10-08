@@ -106,7 +106,7 @@ int run_ticker_simulation(
         const Options options = parse_options(argc, argv, executable_name);
         load_environment_file(options.env_file, options.env_file_explicit);
 
-        EventHubPublisher publisher(
+        EventHubProducer producer(
             require_environment_variable("EVENTHUBS_HOST"),
             require_environment_variable("EVENTHUB_NAME"),
             payload_format);
@@ -133,7 +133,7 @@ int run_ticker_simulation(
 
             next_batch += std::chrono::seconds(1);
             auto events = generate_batch(tickers, options.rate, random);
-            publisher.publish(events);
+            producer.publish(events);
             total += events.size();
             std::cout << "sent " << events.size() << " events; total=" << total
                       << '\n';

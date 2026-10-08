@@ -186,7 +186,7 @@ StockTick deserialize_stock_tick_avro_raw(
     return tick;
 }
 
-class EventHubPublisher::Impl {
+class EventHubProducer::Impl {
 public:
     Impl(
         std::string fully_qualified_namespace,
@@ -242,7 +242,7 @@ private:
     AvroPayloadFormat payload_format;
 };
 
-EventHubPublisher::EventHubPublisher(
+EventHubProducer::EventHubProducer(
     std::string fully_qualified_namespace,
     std::string event_hub_name,
     AvroPayloadFormat payload_format) {
@@ -259,12 +259,12 @@ EventHubPublisher::EventHubPublisher(
         payload_format);
 }
 
-EventHubPublisher::~EventHubPublisher() = default;
-EventHubPublisher::EventHubPublisher(EventHubPublisher&&) noexcept = default;
-EventHubPublisher& EventHubPublisher::operator=(
-    EventHubPublisher&&) noexcept = default;
+EventHubProducer::~EventHubProducer() = default;
+EventHubProducer::EventHubProducer(EventHubProducer&&) noexcept = default;
+EventHubProducer& EventHubProducer::operator=(
+    EventHubProducer&&) noexcept = default;
 
-void EventHubPublisher::publish(const std::vector<StockTick>& ticks) {
+void EventHubProducer::publish(const std::vector<StockTick>& ticks) {
     impl_->publish(ticks);
 }
 

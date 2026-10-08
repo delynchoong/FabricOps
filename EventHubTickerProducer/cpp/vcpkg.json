@@ -1,5 +1,5 @@
 {
-  "name": "eventhub-ticker-publisher",
+  "name": "eventhub-ticker-producer",
   "version-string": "0.1.0",
   "dependencies": [
     "avro-cpp",

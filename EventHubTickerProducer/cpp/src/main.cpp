@@ -5,5 +5,5 @@ int main(int argc, char* argv[]) {
         argc,
         argv,
         tickpoc::AvroPayloadFormat::ObjectContainer,
-        "eventhub_ticker_publisher");
+        "eventhub_ticker_producer");
 }

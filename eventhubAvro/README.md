@@ -1,13 +1,50 @@
-# C++ Avro Publisher for Azure Event Hubs
+# C++ Avro Producer for Azure Event Hubs
 
-This customer-ready sample generates simulated stock-ticker events, serializes
-each event as an Apache Avro Object Container File, and publishes it to Azure
-Event Hubs using passwordless Microsoft Entra authentication.
+This C++ sample demonstrates the validated Fabric Eventhouse ingestion pattern:
 
-The sample intentionally keeps the implementation in one source file:
-[`eventhub_avro_publisher.cpp`](eventhub_avro_publisher.cpp).
+```text
+Azure Event Hubs EventData
+└── complete binary Avro OCF
+    └── top-level record
+        ├── fixed primitive fields
+        └── variablefields map -> KQL dynamic column
+```
 
-## Message format
+Use [`eventhub_avro_map_producer.cpp`](eventhub_avro_map_producer.cpp) as the
+primary implementation. It publishes five records with different dynamic map
+keys in one self-describing OCF body and validates the exact bytes before
+sending.
+
+The directory also includes:
+
+- [`eventhub_avro_producer.cpp`](eventhub_avro_producer.cpp), which sends
+  one fixed-field `StockTick` record per EventData body as a simpler baseline.
+
+Each executable remains self-contained for reuse as an independent sample.
+Evaluate both before using them in production.
+
+## Validated and unsupported scenarios
+
+| Scenario | Result | Guidance |
+| --- | --- | --- |
+| Complete OCF containing a record and embedded schema | Successfully ingested | Required |
+| Fixed primitive fields in the record | Decoded by schema order without repeating field labels | Recommended |
+| Avro map stored in a KQL `dynamic` column | Arbitrary keys queried successfully | Recommended |
+| Multiple records and blocks in one OCF/EventData | Five records produced five Eventhouse rows | Validated |
+| Raw Avro datum without OCF header/schema | Rejected with `wrong magic in header` | Do not use |
+| Cross-database routing with the `Database` property | No rows reached the target database | Not supported by Fabric |
+
+The standalone project intentionally does not include raw-datum or
+cross-database producers. Those executables in the larger FabricOps PoC are
+negative compatibility tests, not deployable patterns.
+
+## Recommended message format
+
+The recommended message schema is documented in
+[Verified record and map producer](#verified-record-and-map-producer).
+Each EventData body must be a complete Avro OCF beginning with `Obj\x01`.
+
+## Fixed-record baseline
 
 Each Event Hubs message body is a complete Avro Object Container File containing
 one `StockTick` record:
@@ -33,8 +70,18 @@ one `StockTick` record:
 }
 ```
 
-The body begins with the Avro container magic bytes `Obj\x01` and includes the
-writer schema. The AMQP message also contains:
+The body begins with the Avro container file signature `Obj\x01` and includes
+the writer schema. This short signature helps software recognize the file
+format before trying to read the rest.
+
+For an Avro Object Container File, the first four bytes are:
+
+```text
+4F 62 6A 01
+ O  b  j \x01
+```
+
+The AMQP message also contains:
 
 ```text
 Content-Type: avro/binary
@@ -44,6 +91,8 @@ Application property: avro.schema.name=sample.StockTick
 
 Azure Event Hubs stores and forwards the body as opaque bytes. A downstream
 consumer must be configured to parse the body as Avro.
+
+This sample uses AMQP endpoints, but Azure Event Hubs supports both AMQP endpoints and Kafka-compatible endpoints. They are two different ways of accessing the same Event Hub partitions and retained events.
 
 ### Field usage
 
@@ -62,6 +111,227 @@ that are constant, unused, or already available from Event Hubs metadata.
 For a new schema, consistent `camelCase` names are conventional; these lowercase
 names are retained to match the existing `StockTicks` Eventhouse sample.
 
+### Alternative whole-record capture
+
+Avro isn't schema-less: every message still has a writer schema that defines
+all its fields. Eventhouse can nevertheless keep a stable table contract when
+the Avro records contain additional top-level fields. Store the five fields
+used for filtering and aggregation as typed columns, and capture everything
+else in a `dynamic` property bag:
+
+```kusto
+.create-merge table StockTicks (
+    eventname: string,
+    eventtime: datetime,
+    ticker: string,
+    price: real,
+    eventdesc: string,
+    properties: dynamic
+)
+```
+
+Map the fixed fields normally, then map the complete record to `properties`
+with `DropMappedFields`. The transform removes fields already mapped to typed
+columns, leaving only the additional fields:
+
+```kusto
+.create-or-alter table StockTicks ingestion avro mapping
+'StockTicksFlexibleAvroMapping'
+'[{"column":"eventname","path":"$.eventname"},
+  {"column":"eventtime","path":"$.eventtime","transform":"DateTimeFromUnixMilliseconds"},
+  {"column":"ticker","path":"$.ticker"},
+  {"column":"price","path":"$.price"},
+  {"column":"eventdesc","path":"$.eventdesc"},
+  {"column":"properties","path":"$","transform":"DropMappedFields"}]'
+```
+
+For example, a future Avro writer schema could add `exchange`, `currency`, or
+`sourceSystem` without adding Eventhouse columns. Query those values with:
+
+```kusto
+StockTicks
+| extend
+    exchange = tostring(properties.exchange),
+    currency = tostring(properties.currency)
+```
+
+This whole-record `DropMappedFields` approach is supported by Kusto mappings,
+but it was not the final PoC design. When the producer is under your control,
+prefer the explicit `variablefields` Avro map validated below. It gives the
+dynamic contract a stable location and avoids uncontrolled top-level schema
+growth.
+
+## Verified record and map producer
+
+`eventhub_avro_map_producer` implements the governed design described above.
+Its top-level Avro `record` has five fixed fields followed by a map:
+
+```json
+{
+  "type": "record",
+  "name": "DynamicMapTick",
+  "namespace": "sample",
+  "fields": [
+    {"name": "eventname", "type": "string"},
+    {
+      "name": "eventtime",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    },
+    {"name": "ticker", "type": "string"},
+    {"name": "price", "type": "double"},
+    {"name": "eventdesc", "type": "string"},
+    {
+      "name": "variablefields",
+      "type": {
+        "type": "map",
+        "values": [
+          "null",
+          "string",
+          "boolean",
+          "long",
+          "double"
+        ]
+      },
+      "default": {}
+    }
+  ]
+}
+```
+
+The fixed field names are stored once in the OCF writer schema. Record bodies
+encode their fixed values in schema order. Map entry keys are carried with
+their values because those names vary by record.
+
+The producer creates one binary OCF with five records and five data blocks:
+
+| Ticker | Map keys | Key count |
+| --- | --- | ---: |
+| `MAP1` | `venue` | 1 |
+| `MAP2` | `bid`, `isIndicative` | 2 |
+| `MAP3` | `currency`, `tradePrice`, `tradeSize` | 3 |
+| `MAP4` | `auctionType`, `imbalance`, `isClosingAuction`, `matchedVolume` | 4 |
+| `MAP5` | `condition`, `isCorrection`, `note`, `sequenceNumber`, `yield` | 5 |
+
+The implementation uses Avro memory streams. Before publishing, it decodes the
+exact body, compares all five records with their sources, structurally parses
+the OCF header and blocks, and verifies the `Obj\x01` header and five sync
+markers.
+
+Create the Eventhouse table and mapping:
+
+```kusto
+.create-merge table DynamicTicks (
+    eventname:string,
+    eventtime:datetime,
+    ticker:string,
+    price:real,
+    eventdesc:string,
+    variablefields:dynamic
+)
+
+.create-or-alter table DynamicTicks ingestion avro mapping
+'DynamicTicksAvroMapping'
+'[{"column":"eventname","path":"$.eventname"},
+  {"column":"eventtime","path":"$.eventtime","transform":"DateTimeFromUnixMilliseconds"},
+  {"column":"ticker","path":"$.ticker"},
+  {"column":"price","path":"$.price"},
+  {"column":"eventdesc","path":"$.eventdesc"},
+  {"column":"variablefields","path":"$.variablefields"}]'
+```
+
+Validate and dump the exact body locally without publishing:
+
+```powershell
+& "C:\b\eventhub-avro\Release\eventhub_avro_map_producer.exe" `
+  --validate-only `
+  --print-message `
+  --dump-avro ".\dynamic-map-five-blocks.avro"
+```
+
+Publish the same scenario:
+
+```powershell
+$env:EVENTHUBS_HOST = "<namespace>.servicebus.windows.net"
+$env:EVENTHUB_NAME = "<event-hub-name>"
+
+& "C:\b\eventhub-avro\Release\eventhub_avro_map_producer.exe" `
+  --print-message `
+  --dump-avro ".\dynamic-map-five-blocks.avro"
+```
+
+The EventData application properties select the verified dynamic target:
+
+```text
+Table=DynamicTicks
+Format=Avro
+IngestionMappingReference=DynamicTicksAvroMapping
+Compression=None
+```
+
+Validate known and previously unknown map keys in KQL:
+
+```kusto
+DynamicTicks
+| where eventname == "dynamic Avro map ticks"
+| summarize arg_max(eventtime, *) by ticker
+| extend keys=bag_keys(variablefields)
+| mv-expand key=keys
+| extend
+    key=tostring(key),
+    value=variablefields[tostring(key)],
+    valueType=gettype(variablefields[tostring(key)])
+| project ticker, key, value, valueType
+| order by ticker asc, key asc
+```
+
+Direct key access works without adding an ingestion mapping entry for each map
+key:
+
+```kusto
+DynamicTicks
+| where ticker == "MAP3"
+| top 1 by eventtime desc
+| project
+    currency=tostring(variablefields.currency),
+    tradePrice=todouble(variablefields.tradePrice),
+    tradeSize=tolong(variablefields.tradeSize)
+```
+
+## Options that did not work
+
+### Raw Avro datum without an embedded schema
+
+The Fabric direct connection was tested with raw binary record data that did
+not contain the OCF `Obj\x01` header, writer schema, metadata, or sync marker.
+Event Hubs accepted the messages, but Eventhouse produced no rows and reported:
+
+```text
+BadRequest_InvalidBlob: wrong magic in header
+```
+
+Setting `ContentType` or `avro.schema.name` AMQP metadata does not replace the
+writer schema required inside the body. Always send a complete OCF for this
+connector.
+
+### Cross-database message routing
+
+Same-database table routing works with the case-sensitive `Table` and
+`IngestionMappingReference` properties. Cross-database routing did not work
+when messages also supplied:
+
+```text
+Database=TASDatabase
+```
+
+ADX supports this only when the receiving data connection is configured with
+`databaseRouting=Multi`. Fabric Eventhouse does not expose an equivalent
+setting or a customer-addressable `Microsoft.Kusto/clusters/...` ARM resource.
+Use one static Event Hub/data connection per destination database, or implement
+a custom consumer that performs destination-specific ingestion.
+
 ### Why use an Avro Object Container?
 
 For the validated direct Fabric Eventhouse connection, each Event Hubs message
@@ -77,7 +347,7 @@ schemas, raw datum encoding may be more efficient.
 
 ### Serialization and deserialization
 
-- **Serialization is required by the publisher.** It converts the in-memory
+- **Serialization is required by the producer.** It converts the in-memory
   `StockTick` C++ object into the Avro bytes sent in `EventData.Body`.
 - **Deserialization is not required to publish.** This sample uses it only when
   `--validate-payload` is supplied. It reads the generated container back and
@@ -100,6 +370,7 @@ The vcpkg manifest restores:
 - Apache Avro C++
 - Azure Identity SDK for C++
 - Azure Event Hubs SDK for C++
+- fmt, used for an Avro C++ 1.12.1 header compatibility workaround
 
 ## Authenticate
 
@@ -119,7 +390,7 @@ role.
 Use a short build path to avoid Windows dependency path-length problems:
 
 ```powershell
-$source = Join-Path (Get-Location) "eventhubAvro"
+$source = Get-Location
 $vcpkgRoot = Join-Path $env:USERPROFILE "vcpkg"
 $cmake = (Get-Command cmake -ErrorAction SilentlyContinue).Source
 
@@ -144,10 +415,7 @@ if (-not (Test-Path $cmake)) {
 & $cmake --build "C:\b\eventhub-avro" --config Release
 ```
 
-In PowerShell, assigning the executable path to `$cmake` doesn't make
-`cmake` a command. The call operator (`& $cmake`) is required to execute the
-path stored in the variable. If Visual Studio is installed elsewhere, locate
-its CMake executable with:
+If Visual Studio is installed elsewhere, locate its CMake executable with:
 
 ```powershell
 Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft Visual Studio" `
@@ -175,7 +443,7 @@ Set the Event Hubs namespace hostname and Event Hub name:
 $env:EVENTHUBS_HOST = "<namespace>.servicebus.windows.net"
 $env:EVENTHUB_NAME = "<event-hub-name>"
 
-& "C:\b\eventhub-avro\Release\eventhub_avro_publisher.exe" `
+& "C:\b\eventhub-avro\Release\eventhub_avro_producer.exe" `
   --count 25 `
   --batch-size 10 `
   --interval-ms 100 `
@@ -191,6 +459,15 @@ Arguments:
 | `--interval-ms` | `100` | Delay between batch sends |
 | `--validate-payload` | Off | Deserialize each generated OCF locally and verify a one-record round trip before publishing |
 | `--help` | | Display usage |
+
+The map producer has these arguments:
+
+| Argument | Purpose |
+| --- | --- |
+| `--print-message` | Print all five logical records and binary OCF summary |
+| `--dump-avro PATH` | Write the exact `EventData.Body` bytes to a file |
+| `--validate-only` | Perform the complete local round trip without publishing |
+| `--help` | Display usage |
 
 The requested minimum batch count is:
 
@@ -213,11 +490,11 @@ Sent batch 3: events=5, totalEventsSent=25
 Completed test: eventsSent=25, batchesSent=3
 ```
 
-No connection strings or access keys are required by the publisher.
+No connection strings or access keys are required by the producer.
 
-## Is this the recommended sending method?
+## Recommended sending method?
 
-For this direct Eventhouse ingestion scenario, yes:
+For this direct Eventhouse ingestion scenario:
 
 1. Serialize each logical stock tick as its own complete Avro OCF body.
 2. Create an Event Hubs `EventDataBatch`.
@@ -231,10 +508,19 @@ into one EventData body. This preserves per-message metadata and lets
 Eventhouse decode each stock tick independently.
 
 The fixed `--batch-size` makes tests deterministic. In a production
-throughput-oriented publisher, it is common to keep adding messages until
+throughput-oriented producer, it is common to keep adding messages until
 `TryAdd` returns false, send the full batch, and then continue with a new
 batch. Production code should also define retry, cancellation, idempotency,
 and failed-message handling behavior.
+
+The validated demo namespace uses the Standard tier, where the maximum
+publication size is 1 MB for either one event or an entire batch. A good
+starting target is 500-800 KB per batch, leaving room for AMQP metadata and
+per-message overhead rather than aiming exactly at 1 MB. The current Avro
+messages are approximately 406 bytes each, so start with 500 messages per
+batch (about 203 KB of body data) or increase toward 1,000 messages (about
+406 KB plus AMQP overhead) while monitoring latency and throughput. Check the
+limits for the tier used by your own namespace.
 
 ## Configure a Fabric Eventhouse destination
 
@@ -255,7 +541,7 @@ az eventhubs eventhub consumer-group create `
   --name fabric-eventhouse
 ```
 
-The publisher doesn't select a consumer group. Consumer groups are selected
+The producer doesn't select a consumer group. Consumer groups are selected
 only by receivers such as the Eventhouse data connection.
 
 ### 2. Create the Eventhouse table and Avro mapping
@@ -339,9 +625,9 @@ Test in layers so a failure can be isolated quickly.
 ### 1. Check the executable and local Avro round trip
 
 ```powershell
-& "C:\b\eventhub-avro\Release\eventhub_avro_publisher.exe" --help
+& "C:\b\eventhub-avro\Release\eventhub_avro_producer.exe" --help
 
-& "C:\b\eventhub-avro\Release\eventhub_avro_publisher.exe" `
+& "C:\b\eventhub-avro\Release\eventhub_avro_producer.exe" `
   --count 5 `
   --batch-size 2 `
   --interval-ms 100 `
@@ -355,7 +641,8 @@ should report three batch sends: 2, 2, and 1 message.
 
 ### 2. Confirm Event Hubs accepted the send
 
-The process must exit with code `0` and print `Sent Avro OCF`. For repeatable
+The process must exit with code `0`, print `Sent batch`, and list each
+`Avro OCF` event. For repeatable
 integration testing, publish a small count such as 1-5 rather than a long
 continuous stream. Azure Event Hubs metrics can also confirm incoming
 messages, but they don't prove that Eventhouse decoded them.

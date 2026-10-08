@@ -32,3 +32,6 @@ Thumbs.db
 *.token
 *token_cache*
 fabric_msal_cache.bin
+
+# Generated Avro payload dumps
+/dynamic-map-live-test.avro
