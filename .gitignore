@@ -32,3 +32,6 @@ Thumbs.db
 *.token
 *token_cache*
 fabric_msal_cache.bin
+
+# Generated Spark stress-test evidence
+EventhouseKustoIngest/spark/results/
