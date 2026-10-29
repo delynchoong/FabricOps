@@ -16,6 +16,7 @@ using them outside a development environment.
 | [eventhubAvro](eventhubAvro/README.md) | Customer-ready, single-file C++ sample for publishing Avro Object Container events to Azure Event Hubs. |
 | [KustoCommands](KustoCommands/README.md) | Source-linked Eventhouse/ADX optimization commands and read-only Fabric workspace monitoring queries for ingestion, performance, throttling, and scaling investigations. |
 | [NYC Taxi Medallion](NYC_Taxi_Medallion/README.md) | Bronze, Silver, and Gold lakehouse architecture using NYC TLC taxi data, Fabric notebooks, pipelines, Direct Lake, and Power BI. |
+| [RayfinApps](RayfinApps/) | Microsoft Fabric App templates: [Finance Analytics](RayfinApps/finance-analytics/README.md) with illustrative offline data, and [Helsinki Public Transport](RayfinApps/helsinki-public-transport/README.md) with live transit maps backed by Fabric Real-Time Intelligence. |
 
 ## Authentication
 
