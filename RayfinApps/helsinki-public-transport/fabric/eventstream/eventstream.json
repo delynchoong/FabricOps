@@ -1,0 +1,50 @@
+{
+  "sources": [
+    {
+      "id": "__SOURCE_ID__",
+      "name": "HslEventsSource",
+      "type": "CustomEndpoint",
+      "properties": {}
+    }
+  ],
+  "destinations": [
+    {
+      "id": "__DESTINATION_ID__",
+      "name": "Eventhouse",
+      "type": "Eventhouse",
+      "properties": {
+        "dataIngestionMode": "ProcessedIngestion",
+        "workspaceId": "__WORKSPACE_ID__",
+        "itemId": "__KQL_DATABASE_ID__",
+        "databaseName": "__KQL_DATABASE_NAME__",
+        "tableName": "raw_events",
+        "inputSerialization": {
+          "type": "Json",
+          "properties": {
+            "encoding": "UTF8"
+          }
+        }
+      },
+      "inputNodes": [
+        {
+          "name": "HslEvents-stream"
+        }
+      ]
+    }
+  ],
+  "streams": [
+    {
+      "id": "__STREAM_ID__",
+      "name": "HslEvents-stream",
+      "type": "DefaultStream",
+      "properties": {},
+      "inputNodes": [
+        {
+          "name": "HslEventsSource"
+        }
+      ]
+    }
+  ],
+  "operators": [],
+  "compatibilityLevel": "1.1"
+}

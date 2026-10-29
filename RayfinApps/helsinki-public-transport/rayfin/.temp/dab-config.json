@@ -1,0 +1,69 @@
+{
+  "$schema": "https://github.com/Azure/data-api-builder/releases/download/v1.5.56/dab.draft.schema.json",
+  "entities": {
+    "VehicleComment": {
+      "source": "VehicleComments",
+      "permissions": [
+        {
+          "role": "authenticated",
+          "actions": [
+            {
+              "action": "update",
+              "policy": {
+                "database": "@claims.sub eq @item.user_id"
+              }
+            },
+            {
+              "action": "delete",
+              "policy": {
+                "database": "@claims.sub eq @item.user_id"
+              }
+            },
+            "create",
+            "read"
+          ]
+        }
+      ],
+      "x-schema": {
+        "fields": {
+          "id": {
+            "dbType": "UNIQUEIDENTIFIER",
+            "nullable": false
+          },
+          "vehicle_id": {
+            "dbType": "NVARCHAR(MAX)",
+            "nullable": false
+          },
+          "route": {
+            "dbType": "NVARCHAR(MAX)",
+            "nullable": true
+          },
+          "body": {
+            "dbType": "NVARCHAR(MAX)",
+            "nullable": false
+          },
+          "author": {
+            "dbType": "NVARCHAR(MAX)",
+            "nullable": false
+          },
+          "createdAt": {
+            "dbType": "DATETIME2",
+            "nullable": false
+          },
+          "user_id": {
+            "dbType": "NVARCHAR(MAX)",
+            "nullable": false
+          }
+        },
+        "constraints": {
+          "primaryKey": {
+            "name": "PK_VehicleComments",
+            "columns": [
+              "id"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

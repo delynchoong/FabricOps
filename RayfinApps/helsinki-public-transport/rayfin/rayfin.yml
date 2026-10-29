@@ -1,0 +1,36 @@
+id: helsinki-public-transport
+name: Helsinki Public Transport
+version: 1.0.0
+services:
+  auth:
+    enabled: true
+    fabric:
+      enabled: true
+    allowedRedirectUris:
+      - http://localhost:5173
+      - http://127.0.0.1:5173
+      - https://rival-quail-0cf5f15638-westus.webapp.fabricapps.net
+  data:
+    enabled: true
+    dialect: mssql
+  storage:
+    enabled: false
+  functions:
+    enabled: false
+  staticHosting:
+    enabled: true
+    folder: dist
+    buildCommand: npm run build:fabric
+    indexDocument: index.html
+    assetAccess: protected
+connectors:
+  transitModel:
+    connector: fabric-semanticmodel
+    version: "1"
+    auth:
+      type: delegated
+    config:
+      workspaceId: e3d88e7d-3671-4d52-b141-eb0e30af16e4
+      itemId: 81124ada-366e-4508-aae1-35ccfac962e6
+    operations:
+      - name: executeQuery

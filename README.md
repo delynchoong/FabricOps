@@ -14,6 +14,7 @@ using them outside a development environment.
 | [EventhouseKustoIngest](EventhouseKustoIngest/README.md) | C++ Apache Avro stock-ticker generator with selectable Eventhouse streaming and queued ingestion. |
 | [EventHubTickerPublisher](EventHubTickerPublisher/README.md) | C++ Apache Avro stock-ticker publisher using passwordless Azure Event Hubs publishing and direct Fabric Eventhouse ingestion. |
 | [eventhubAvro](eventhubAvro/README.md) | Customer-ready, single-file C++ sample for publishing Avro Object Container events to Azure Event Hubs. |
+| [KustoCommands](KustoCommands/README.md) | Source-linked Eventhouse/ADX optimization commands and read-only Fabric workspace monitoring queries for ingestion, performance, throttling, and scaling investigations. |
 | [NYC Taxi Medallion](NYC_Taxi_Medallion/README.md) | Bronze, Silver, and Gold lakehouse architecture using NYC TLC taxi data, Fabric notebooks, pipelines, Direct Lake, and Power BI. |
 
 ## Authentication
