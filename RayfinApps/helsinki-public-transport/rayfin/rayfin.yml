@@ -1,0 +1,36 @@
+id: helsinki-public-transport
+name: Helsinki Public Transport
+version: 1.0.0
+services:
+  auth:
+    enabled: true
+    fabric:
+      enabled: true
+    allowedRedirectUris:
+      - http://localhost:5173
+      - http://127.0.0.1:5173
+      - ${HELSINKI_APP_ORIGIN}
+  data:
+    enabled: true
+    dialect: mssql
+  storage:
+    enabled: false
+  functions:
+    enabled: false
+  staticHosting:
+    enabled: true
+    folder: dist
+    buildCommand: npm run build:fabric
+    indexDocument: index.html
+    assetAccess: protected
+connectors:
+  transitModel:
+    connector: fabric-semanticmodel
+    version: "1"
+    auth:
+      type: delegated
+    config:
+      workspaceId: ${FABRIC_WORKSPACE_ID}
+      itemId: ${HELSINKI_SEMANTIC_MODEL_ID}
+    operations:
+      - name: executeQuery

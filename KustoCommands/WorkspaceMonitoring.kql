@@ -1,0 +1,329 @@
+// Read-only Fabric Eventhouse troubleshooting queries; see WorkspaceMonitoring.README.md.
+// Run each numbered query separately, including its let statements; never run the whole file.
+// Sections 0-19 target the source workspace's MONITORING KQL database, not the application database.
+// Replace empty ID filters with discovered WorkspaceId and ItemId strings to narrow investigation.
+// Empty filters intentionally include all visible items in the selected database; timestamps are UTC.
+// Tables can be absent until supported activity generates telemetry; discover schemas first.
+// Monitoring is delayed historical evidence, not a live node CPU/CU or active-query counter.
+// Scale-out logs are 24-hour reason summaries; sub-optimal-size logs are five-minute heartbeats.
+
+// 0. Discover tables and verify each documented schema before using its queries.
+
+// List tables actually available in this monitoring database.
+.show tables
+
+// Inspect ingestion, materialization, and export metric fields.
+.show table EventhouseMetrics schema as json
+
+// Inspect recorded query performance and failure fields.
+.show table EventhouseQueryLogs schema as json
+
+// Inspect management-command activity fields.
+.show table EventhouseCommandLogs schema as json
+
+// Inspect background data-operation fields.
+.show table EventhouseDataOperationsLogs schema as json
+
+// Inspect queued-ingestion result fields.
+.show table EventhouseIngestionResultsLogs schema as json
+
+// Inspect capacity throttling state fields.
+.show table EventhouseCapacityThrottlingState schema as json
+
+// Inspect daily scale-out reason summary fields.
+.show table EventhouseScaleoutEvents schema as json
+
+// Inspect reduced-size heartbeat fields.
+.show table EventhouseSubOptimalSizeAfterThrottling schema as json
+
+// 1. Discover reporting items, available metric names, and representative dimensions.
+let lookback = 24h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseMetrics
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| summarize Records = count(), Samples = sum(MetricCount),
+            LastSeen = max(Timestamp),
+            ExampleDimensions = take_any(MetricSpecificDimensions)
+    by WorkspaceId, WorkspaceName, ItemId, ItemName, CapacityId, MetricName
+| extend TimeSinceLastMetric = now() - LastSeen
+| order by ItemName asc, MetricName asc
+
+// 2. Compare raw metric samples without hiding dimensions or assuming all metrics share units.
+let lookback = 1h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseMetrics
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| project Timestamp, WorkspaceId, ItemId, ItemName, MetricName,
+          MetricCount, MetricSumValue, MetricMinValue, MetricMaxValue,
+          MetricSpecificDimensions
+| top 100 by Timestamp desc
+
+// 3. Trend reported raw ingestion volume by table; GiB uses 1024^3 bytes, not CPU/CU consumption.
+let lookback = 24h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseMetrics
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| where MetricName == "IngestionVolumeInBytes"
+| extend DatabaseName = tostring(MetricSpecificDimensions.Database),
+         TableName = tostring(MetricSpecificDimensions.Table)
+| summarize IngestedBytes = sum(MetricSumValue)
+    by WorkspaceId, ItemId, ItemName, DatabaseName, TableName, bin(Timestamp, 5m)
+| extend IngestedGiB = IngestedBytes / 1073741824.0
+| order by Timestamp asc
+
+// 4. Separate batching, discovery, and ingestion latency using sample-weighted averages in seconds.
+let lookback = 24h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseMetrics
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| where MetricName in ("BatchDurationSec", "DiscoveryLatencyInSeconds", "IngestionLatencyInSeconds")
+| extend DatabaseName = tostring(MetricSpecificDimensions.Database),
+         TableName = tostring(MetricSpecificDimensions.Table),
+         ComponentType = tostring(MetricSpecificDimensions.ComponentType),
+         ComponentName = tostring(MetricSpecificDimensions.ComponentName),
+         IngestionKind = tostring(MetricSpecificDimensions.IngestionKind)
+| summarize Samples = sum(MetricCount), TotalReportedSeconds = sum(MetricSumValue)
+    by WorkspaceId, ItemId, ItemName, MetricName, DatabaseName, TableName,
+       ComponentType, ComponentName, IngestionKind, bin(Timestamp, 5m)
+| extend AverageSeconds = iff(Samples > 0, todouble(TotalReportedSeconds) / Samples, real(null))
+| order by Timestamp asc
+
+// 5. Inspect queue length and oldest-message age separately; gauges must not be summed as throughput.
+let lookback = 24h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseMetrics
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| where MetricName in ("QueueLength", "QueueOldestMessage")
+| extend ComponentType = tostring(MetricSpecificDimensions.ComponentType)
+| summarize Samples = sum(MetricCount), TotalReportedValue = sum(MetricSumValue)
+    by WorkspaceId, ItemId, ItemName, MetricName, ComponentType, bin(Timestamp, 5m)
+| extend AverageValue = iff(Samples > 0, todouble(TotalReportedValue) / Samples, real(null)),
+         Unit = iff(MetricName == "QueueLength", "messages", "seconds")
+| order by Timestamp asc
+
+// 6. Check batch size and source count for inefficient small batches without mixing bytes and counts.
+let lookback = 24h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseMetrics
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| where MetricName in ("BatchSizeBytes", "BatchBlobCount")
+| extend DatabaseName = tostring(MetricSpecificDimensions.Database),
+         TableName = tostring(MetricSpecificDimensions.Table)
+| summarize Samples = sum(MetricCount), TotalReportedValue = sum(MetricSumValue)
+    by WorkspaceId, ItemId, ItemName, MetricName, DatabaseName, TableName, bin(Timestamp, 5m)
+| extend AverageValue = iff(Samples > 0, todouble(TotalReportedValue) / Samples, real(null)),
+         Unit = iff(MetricName == "BatchSizeBytes", "bytes", "sources")
+| order by Timestamp asc
+
+// 7. Group queued-ingestion result records by observed status and error code, not source event count.
+let lookback = 24h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseIngestionResultsLogs
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| summarize ResultRecords = count()
+    by WorkspaceId, ItemId, ItemName, DatabaseName, TableName,
+       Status, ResultCode, IngestionFailureStatus, bin(Timestamp, 5m)
+| order by Timestamp asc
+
+// 8. Inspect recent queued-ingestion failures and their correlation IDs for follow-up investigation.
+let lookback = 24h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseIngestionResultsLogs
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| where Status == "Failed" or isnotempty(IngestionErrorDetails) or isnotempty(IngestionFailureStatus)
+| project Timestamp, WorkspaceId, ItemId, ItemName, DatabaseName, TableName,
+          Status, ResultCode, IngestionFailureStatus, IngestionErrorDetails,
+          IngestionResultDetails, ShouldRetry, IsIngestionOriginatesFromUpdatePolicy,
+          IngestionOperationId, OperationId, CorrelationId
+| top 100 by Timestamp desc
+
+// 9. Inspect capacity throttle-state records; record counts are not distinct throttle incidents.
+let lookback = 24h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseCapacityThrottlingState
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| project Timestamp, WorkspaceId, ItemId, ItemName, CapacityId, ThrottlingState
+| order by WorkspaceId asc, ItemId asc, Timestamp asc
+
+// 10. Show each Eventhouse's latest observed throttle state, not a guaranteed current live state.
+let lookback = 7d;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseCapacityThrottlingState
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| summarize arg_max(Timestamp, ItemName, CapacityId, ThrottlingState) by WorkspaceId, ItemId
+| project ObservedAt = Timestamp, WorkspaceId, ItemId, ItemName, CapacityId,
+          ThrottlingState, TimeSinceObservation = now() - Timestamp
+| order by ObservedAt desc
+
+// 11. Read daily scale-out reason summaries; Timestamp is not the time of each underlying resize.
+let lookback = 7d;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseScaleoutEvents
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| project ReportedAt = Timestamp, WorkspaceId, ItemId, ItemName, CapacityId, ScaleoutReason
+| order by ReportedAt desc
+
+// 12. Find reduced-size heartbeats after throttling; absence does not prove that the engine recovered.
+let lookback = 24h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseSubOptimalSizeAfterThrottling
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| summarize FirstObserved = min(Timestamp), LastObserved = max(Timestamp),
+            HeartbeatRecords = count()
+    by WorkspaceId, ItemId, ItemName, CapacityId
+| extend TimeSinceLastHeartbeat = now() - LastObserved
+| order by LastObserved desc
+
+// 13. Compare recorded query latency, volume, and CPU by application and completion status.
+let lookback = 24h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseQueryLogs
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| summarize QueryRecords = count(), P50Ms = percentile(DurationMs, 50),
+            P95Ms = percentile(DurationMs, 95), P99Ms = percentile(DurationMs, 99),
+            CpuSeconds = sum(CpuTimeMs) / 1000.0, PeakMemoryBytes = max(MemoryPeakBytes)
+    by WorkspaceId, ItemId, ItemName, DatabaseName, SourceApplication, Status, bin(Timestamp, 5m)
+| order by Timestamp asc
+
+// 14. Inspect the most CPU-expensive recorded queries without exporting their entire query text.
+let lookback = 24h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseQueryLogs
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| project Timestamp, WorkspaceId, ItemId, ItemName, DatabaseName, SourceApplication,
+          Status, DurationMs, CpuTimeMs, MemoryPeakBytes, ScannedExtentsCount,
+          ScannedRowsCount, FailureReason, OperationId, CorrelationId,
+          QueryPreview = substring(QueryText, 0, 500)
+| top 50 by CpuTimeMs desc
+
+// 15. Inspect failed or throttled queries and preserve exact failure text to identify the limiting layer.
+let lookback = 24h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseQueryLogs
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| where Status in ("Failed", "Throttled") or isnotempty(FailureReason)
+| project Timestamp, WorkspaceId, ItemId, ItemName, DatabaseName, SourceApplication,
+          Status, FailureReason, ComponentFault, DurationMs, OperationId, CorrelationId
+| top 100 by Timestamp desc
+
+// 16. Measure hot-data cache miss bytes by application; a zero-byte sample yields a null ratio.
+let lookback = 24h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseQueryLogs
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| summarize QueryRecords = count(), HotHitBytes = sum(CacheHotHitsBytes),
+            HotMissBytes = sum(CacheHotMissesBytes)
+    by WorkspaceId, ItemId, ItemName, DatabaseName, SourceApplication, bin(Timestamp, 5m)
+| extend ObservedHotBytes = HotHitBytes + HotMissBytes
+| extend HotMissRatio = iff(ObservedHotBytes > 0, todouble(HotMissBytes) / ObservedHotBytes, real(null))
+| order by Timestamp asc
+
+// 17. Identify costly command types and failure statuses that can compete with query workloads.
+let lookback = 24h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseCommandLogs
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| summarize CommandRecords = count(), CpuSeconds = sum(CpuTimeMs) / 1000.0,
+            P95Ms = percentile(DurationMs, 95), PeakMemoryBytes = max(MemoryPeakBytes),
+            ExampleFailure = take_any(FailureReason)
+    by WorkspaceId, ItemId, ItemName, DatabaseName, SourceApplication, EventhouseCommandType, Status
+| top 50 by CpuSeconds desc
+
+// 18. Attribute background CPU to data-operation kinds without treating it as billed CU consumption.
+let lookback = 24h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseDataOperationsLogs
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| summarize OperationRecords = count(), CpuSeconds = sum(CpuTimeMs) / 1000.0,
+            OriginalBytes = sum(OriginalSizeInBytes), Rows = sum(TotalRowsCount)
+    by WorkspaceId, ItemId, ItemName, DatabaseName, TableName, DataOperationKind, bin(Timestamp, 5m)
+| order by Timestamp asc
+
+// 19. Inspect latest per-dimension materialization/export samples without summing gauges or statuses.
+let lookback = 24h;
+let targetWorkspaceId = "";
+let targetEventhouseId = "";
+EventhouseMetrics
+| where Timestamp > ago(lookback)
+| where isempty(targetWorkspaceId) or WorkspaceId == targetWorkspaceId
+| where isempty(targetEventhouseId) or ItemId == targetEventhouseId
+| where MetricName in (
+    "MaterializedViewAgeSeconds", "MaterializedViewHealth", "MaterializedViewResult",
+    "ContinuousExportMaxLateness", "ContinousExportPendingCount", "ContinuousExportResult")
+| extend Dimensions = tostring(MetricSpecificDimensions)
+| summarize arg_max(Timestamp, MetricCount, MetricSumValue, MetricMinValue, MetricMaxValue)
+    by WorkspaceId, ItemId, ItemName, MetricName, Dimensions
+| extend ReportedAverage = iff(MetricCount > 0, todouble(MetricSumValue) / MetricCount, real(null)),
+         TimeSinceObservation = now() - Timestamp
+| order by ItemName asc, MetricName asc, Timestamp desc
+
+// 20. SWITCH CONTEXT: run these independent commands against the APPLICATION Eventhouse endpoint.
+
+// Inspect queries currently running on the target application Eventhouse, subject to caller visibility.
+.show running queries
+
+// Inspect application Eventhouse admission limits when failures identify workload-group throttling.
+.show workload_groups
+
+// Inspect the application Eventhouse's routing rules rather than assuming an application reached a group.
+.show cluster policy request_classification
+
+// Inspect current application database materialized-view health, enablement, and materialization progress.
+.show materialized-views
+
+// Inspect recent application operations when a long-running backfill or management task is suspected.
+.show operations
