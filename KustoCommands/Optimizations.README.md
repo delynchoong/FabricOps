@@ -4,6 +4,8 @@ A practical command reference for improving **parallelism**, **concurrency**, an
 **load efficiency** at the Eventhouse/cluster, database, and table levels.
 Public Microsoft documentation and engineering blogs checked on **2026-10-29**.
 Only commands with public Microsoft documentation are included.
+Architecture and support-managed configuration notes are not additional commands
+or statements of public product support.
 These are examples, not settings applied to a live environment.
 
 For the same command and query examples with one-line comments, open
@@ -72,6 +74,10 @@ Monitoring visibility is also permission-dependent.
 | One application crowds out others | [Groups and classification](#2-concurrency-admission-control-and-workload-isolation) | Fairness and controlled simultaneous requests | Eventhouse/cluster / Both |
 | Bursts cause 429s despite acceptable steady load | [Queuing](#23-queue-short-bursts-instead-of-immediately-rejecting-them) | Burst absorption, not extra compute | Workload group / Both |
 | Queued ingestion creates many small extents | [Batching](#31-queued-ingestion-batching-throughput-versus-freshness) | Ingestion efficiency and lower merge pressure | Database/table / Both |
+| Streaming writes are slow or alternate between fast and slow requests | [Write-path baseline](#321-streaming-optimization-establish-the-write-path-baseline) and [latency monitoring](#324-validate-latency-distribution-in-workspace-monitoring) | Identify latency distribution, failures, and the actual ingestion path before tuning | Database/table statistics / Both; workspace metrics / Fabric |
+| Streaming table volume exceeds its expected allocation | [Streaming rate hint](#322-right-size-the-streaming-rate-hint-do-not-treat-it-as-a-latency-timer) | Match allocation to measured hourly volume; not a latency timer | Database/table policy / ADX-only public commands |
+| Streaming latency coincides with sealing or derived-table work | [Row-store and competing features](#323-inspect-row-store-sealing-and-competing-table-features) | Separate background cost from request latency | Database/table / Both |
+| Ingestion remains constrained after documented tuning | [Architecture and support-managed settings](#325-architecture-and-support-managed-settings) | Evaluate multi-database distribution and support escalation; no guaranteed throughput increase | Architecture / product-specific; admin-node flag / backend only |
 | ADX ingestion is slot-limited with spare resources | [Capacity](#33-adx-ingestion-operation-concurrency) | Concurrent data-management operations | Cluster / ADX only |
 | Materialization falls behind | [Background capacity](#34-adx-materialization-export-and-maintenance-parallelism) and [views](#45-precompute-repeated-aggregations-with-materialized-views) | Background progress versus query load | Mixed; see sections |
 | High disk misses / repeated dashboard work | [Cache and precomputation](#4-load-reduction-cache-data-layout-and-precomputation) | Less work per request | Database/table/request / Both |
@@ -520,6 +526,240 @@ payload workloads. Workload-group request limits do not govern streaming request
 
 Sources: [streaming policy command][streaming-command],
 [ADX streaming setup][streaming-setup], [Fabric ingestion][fabric-ingest].
+
+#### 3.2.1 Streaming optimization: establish the write-path baseline
+
+**Both for the statistics and data-operation queries below.** Run these against
+the **application Eventhouse/database**, not the workspace monitoring database.
+The policy commands remain **ADX only in the public command reference**; a
+command observed working in a Fabric test does not establish public Fabric support.
+
+The recommendations from the **Simulated EH Producer** investigation were to
+measure the actual streaming write path before changing settings. That experiment
+found **no measurable write-latency improvement** from ingestion-slot increases,
+a streaming rate hint, or workload-group isolation. This is a workload-specific
+observation, not a promise that those settings never affect other workloads.
+Its row-store/timing explanations were hypotheses, not documented tuning controls.
+Only publicly documented commands from that investigation are reproduced here.
+
+Inspect the bucket-level statistics, including failed statuses and request sizes:
+
+```kusto
+.show streamingingestion statistics
+| where Database == "MyDatabase" and Table == "Events"
+| where StartTime > ago(1h)
+| project StartTime, EndTime, IngestionStatus, Count,
+          AvgDuration, MinDuration, MaxDuration,
+          TotalDataSize, TotalRowCount, MinRowCount, MaxRowCount,
+          NumOfRowStoresReferences
+| order by StartTime asc
+```
+
+For comparison across runs, calculate a **request-count-weighted** mean, retaining
+status and time buckets rather than averaging averages:
+
+```kusto
+.show streamingingestion statistics
+| where Database == "MyDatabase" and Table == "Events"
+| where StartTime > ago(1h)
+| extend BucketDurationMs = AvgDuration / 1ms
+| summarize Requests = sum(Count),
+            WeightedDurationMs = sum(BucketDurationMs * Count),
+            Bytes = sum(TotalDataSize), Rows = sum(TotalRowCount),
+            FirstObserved = min(StartTime), LastObserved = max(EndTime)
+    by IngestionStatus, bin(StartTime, 5m)
+| extend AverageWriteMs = iff(Requests > 0, WeightedDurationMs / Requests, real(null))
+| order by StartTime asc
+```
+
+These are already aggregated engine buckets, retained for **14 days**. Filtering
+by their start time is not an exact request-level incident boundary. A percentile
+of `AvgDuration` would be a percentile of **bucket means**, not request p50/p95.
+Visibility is permission-scoped; use appropriate Database Admin/Monitor access
+when investigating failures across producers rather than assuming a partial
+result covers the entire workload.
+For controlled benchmarks, use fixed UTC windows, comparable request sizes,
+the same producer cadence, and separate successful requests from failed statuses.
+Server-side write duration is not producer-to-queryable latency; Event Hubs
+enqueue/discovery, network, retries, and visibility checks can add time.
+
+Source: [streaming ingestion statistics, schema, and retention][streaming-statistics].
+
+#### 3.2.2 Right-size the streaming rate hint; do not treat it as a latency timer
+
+**ADX only for the policy commands below.** Inspect both inherited and explicit
+settings before changing the table override:
+
+```kusto
+.show database MyDatabase policy streamingingestion
+
+.show table Events policy streamingingestion
+
+.alter-merge table Events policy streamingingestion
+    '{"IsEnabled":true,"HintAllocatedRate":1.5}'
+
+.show table Events policy streamingingestion
+```
+
+`HintAllocatedRate` describes expected **GB per hour per table**, not requests/sec,
+an ingestion-slot count, a flush interval, or a sub-200 ms SLA. The example `1.5`
+is illustrative: derive the hint from measured peak hourly volume rather than
+copying it. The policy documentation recommends considering a hint above roughly
+1 GB/hour and warns that a value far above the expected peak can harm query
+performance. A database-level hint should reflect its highest-rate table, not
+the sum of unrelated table rates; an explicit table policy takes precedence.
+
+Re-run the same workload and compare latency distributions, throughput, backlog,
+failures, query performance, and cost. Restore the saved policy if there is no
+benefit; restore inheritance rather than persisting a copied parent policy when
+the original table policy was null.
+
+Sources: [streaming policy and rate-hint guidance][streaming-policy],
+[database policy inspection][show-db-streaming],
+[alter-merge streaming policy][merge-streaming].
+
+#### 3.2.3 Inspect row-store sealing and competing table features
+
+**Both.** Streaming data is made queryable before background row-store sealing
+creates column-store extents. Inspect completed seals without inventing an
+undocumented row-store timer or assuming sealing duration equals write duration:
+
+```kusto
+.show data operations
+| where Database == "MyDatabase" and Table == "Events"
+| where OperationKind == "RowStoreSeal" and Timestamp > ago(1h)
+| summarize Seals = count(), AverageSealDuration = avg(Duration),
+            MaximumSealDuration = max(Duration), CpuSeconds = sum(TotalCpu / 1s),
+            Rows = sum(RowCount), ExtentBytes = sum(ExtentSize)
+    by bin(Timestamp, 5m)
+| order by Timestamp asc
+```
+
+The command reports operations that reached a **final state**, retained for
+30 days; it is not a live count of seals in progress or proof that every operation
+succeeded. Correlated time patterns do not prove sealing
+caused a latency spike. Capture table features that can add derived writes or
+background work before evaluating changes:
+
+```kusto
+.show table Events policy update
+
+.show table Events policy partitioning
+
+.show table Events policy caching
+
+.show materialized-views
+| where SourceTable == "Events"
+| project Name, SourceTable, IsEnabled, IsHealthy, MaterializedTo, LastRunResult
+```
+
+An update policy is attached to the **target** table. The first command only
+shows policies on `Events`; inspect known derived targets too, rather than
+concluding that `Events` triggers no downstream work. Do not disable update
+policies, materialized views, or partitioning just to lower a timing number:
+that changes data coverage or processing behavior. Check intended semantics,
+ingestion correctness, cache pressure, and capacity headroom together.
+
+Sources: [completed data operations and RowStoreSeal][data-operations],
+[update-policy behavior][update], [materialized-view state][show-mv].
+
+#### 3.2.4 Validate latency distribution in workspace monitoring
+
+**Fabric; monitoring database.** Switch from the application database to its
+workspace **monitoring KQL database**. Inspect the metric schema first:
+
+```kusto
+.show table EventhouseMetrics schema as json
+```
+
+Replace the Eventhouse item ID. This query summarizes the streaming-duration
+metric with sample weighting and exposes how many metric records are aggregated:
+
+```kusto
+let targetEventhouseId = "<eventhouse-item-id>";
+EventhouseMetrics
+| where Timestamp > ago(1h) and ItemId == targetEventhouseId
+| where MetricName == "StreamingIngestDuration"
+| summarize MetricRecords = count(), Samples = sum(MetricCount),
+            DurationSumMs = sum(MetricSumValue),
+            SingletonRecords = countif(MetricCount == 1)
+    by WorkspaceId, ItemId, bin(Timestamp, 5m)
+| extend AverageWriteMs = iff(Samples > 0, todouble(DurationSumMs) / Samples, real(null))
+| order by Timestamp asc
+```
+
+Only when the records actually represent single samples can sample percentiles
+be calculated directly from their values:
+
+```kusto
+let targetEventhouseId = "<eventhouse-item-id>";
+EventhouseMetrics
+| where Timestamp > ago(1h) and ItemId == targetEventhouseId
+| where MetricName == "StreamingIngestDuration" and MetricCount == 1
+| summarize SingletonSamples = count(),
+            P50Ms = percentile(MetricSumValue, 50),
+            P95Ms = percentile(MetricSumValue, 95),
+            Under200Ms = countif(MetricSumValue < 200)
+    by WorkspaceId, ItemId, bin(Timestamp, 5m)
+| extend Under200Pct = 100.0 * Under200Ms / SingletonSamples
+| order by Timestamp asc
+```
+
+The last result describes **only singleton records**, not the full workload if
+aggregated records were excluded. Compare coverage with the preceding query;
+an empty singleton result does not mean zero latency. `StreamingIngestDuration`
+does not document a one-record-per-request guarantee, so `MetricCount == 1`
+alone does not establish request-level coverage or a request-latency SLA.
+The displayed percentiles describe observed metric samples. The metric
+has no documented table dimension: do not claim a per-table percentile when other
+tables are ingesting into the same Eventhouse. Its `Timestamp` is the event
+timestamp, not a documented per-request start/end pair. Monitor collection delay
+and retain client request-level measurements when full-workload p50/p95 or
+end-to-end timing is required.
+
+**What to tune, and what not to infer**
+
+| Candidate | Appropriate use / limitation |
+| --- | --- |
+| Streaming rate hint | Match documented resource allocation to expected hourly table volume; not a request cadence control. |
+| Queued batching policy | Controls queued ingestion, not direct streaming request latency. For sustained rates above the documented roughly 4 GB/hour/table guidance, benchmark queued ingestion against freshness requirements. |
+| Workload groups | Protect querying and management-command workloads; streaming ingestion requests are outside their scope. Do not route streaming writes into a group or globally maximize limits as a latency fix. |
+| ADX ingestion capacity | Diagnose the operation category and effective slots first. An unused slot counter is not evidence that streaming needs a higher cap. |
+| Producer/connector settings | Verify the actual streaming versus queued path, supported format, bounded concurrency, request sizes, and upstream throttling. Avoid tuning an observed timing window as if it were a supported service contract. |
+| Capacity and hot cache | Investigate sustained contention, throttling, cold starts, and reduced sizing. Do not infer CPU utilization from operation slots or enlarge hot cache without considering cost. |
+
+Use the [workspace monitoring guide](WorkspaceMonitoring.README.md) for backlog,
+throttling, and sizing correlation. A repeatable fast/slow latency pattern after
+these checks calls for documented evidence and a support investigation, not
+undocumented diagnostic/policy mutations.
+
+Sources: [streaming metric names, units, and dimensions][streaming-metrics],
+[streaming ingestion guidance][streaming-policy], [workload-group scope][groups].
+
+#### 3.2.5 Architecture and support-managed settings
+
+- **Bounded producer concurrency and request size.** Benchmark payload size and
+  concurrency together instead of increasing either without limits. The ADX
+  streaming setup documentation specifies a **4 MB request limit, including data
+  produced by update policies**, and a concurrency limit of six requests per
+  core. These are ADX-documented limits, not recommended concurrency targets or
+  a Fabric sizing formula. Validate the actual connector, retry behavior, and
+  product limits; more in-flight requests can increase throttling and tail latency.
+- **Scale across multiple databases where the workload permits.** Consider
+  distributing independent tenants or ingestion streams across databases when a
+  measured database-scoped bottleneck or isolation requirement justifies it.
+  Benchmark the distribution rather than assuming linear scaling. Databases in
+  the same Eventhouse/cluster still share compute; adding databases does not add
+  capacity or remove upstream, cluster-wide, or Fabric-capacity limits. Account
+  for routing, permissions, per-database policies, downstream processing, and
+  cross-database queries before changing the topology.
+- **Admin-node configuration: custom backend flag.** Treat this as a
+  support-managed backend configuration, **not a publicly documented KQL policy
+  or self-service optimization command**. Multi-admin-node configuration can reduce an administration/coordination bottleneck by distributing database-management work instead of concentrating it on one node.
+
+
+Source for the ADX request limits: [streaming setup and performance considerations][streaming-setup].
+The architecture and backend notes do not introduce additional public commands.
 
 ### 3.3 ADX ingestion operation concurrency
 
@@ -1060,6 +1300,12 @@ are useful when extending this reference:
 [ingest-best-practices]: https://learn.microsoft.com/en-us/kusto/api/netfx/kusto-ingest-best-practices
 [streaming-command]: https://learn.microsoft.com/en-us/kusto/management/alter-table-streaming-ingestion-policy-command?view=azure-data-explorer
 [streaming-setup]: https://learn.microsoft.com/en-us/azure/data-explorer/ingest-data-streaming
+[streaming-statistics]: https://learn.microsoft.com/en-us/kusto/management/streaming-ingestion-statistics?view=microsoft-fabric
+[streaming-policy]: https://learn.microsoft.com/en-us/kusto/management/streaming-ingestion-policy?view=azure-data-explorer
+[show-db-streaming]: https://learn.microsoft.com/en-us/kusto/management/show-database-streaming-ingestion-policy-command?view=azure-data-explorer
+[merge-streaming]: https://learn.microsoft.com/en-us/kusto/management/alter-merge-table-streaming-ingestion-policy-command?view=azure-data-explorer
+[data-operations]: https://learn.microsoft.com/en-us/kusto/management/show-data-operations?view=microsoft-fabric
+[streaming-metrics]: https://learn.microsoft.com/en-us/fabric/real-time-intelligence/monitor-metrics
 [fabric-ingest]: https://learn.microsoft.com/en-us/fabric/real-time-intelligence/get-data-overview
 [capacity]: https://learn.microsoft.com/en-us/kusto/management/capacity-policy?view=azure-data-explorer
 [show-capacity]: https://learn.microsoft.com/en-us/kusto/management/show-capacity-command?view=azure-data-explorer

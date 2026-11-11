@@ -1,0 +1,565 @@
+// Companion to Optimizations.README.md: publicly documented Eventhouse and ADX tuning examples.
+// Run one selected management command at a time; never execute this entire file.
+// Keep each query's set statements and query body together in the same selection.
+// Replace sample database, table, column, and application names before execution.
+// Numeric values are examples, not production recommendations; save policies before changes.
+// Commands apply to both products unless marked ADX ONLY; review permissions in README.md.
+// Table queries assume Events(Timestamp:datetime, TenantId:string, Value:real).
+// Existing auxiliary tables and matching schemas are required where referenced.
+
+// 0. Baseline inspection.
+
+// List databases visible to the caller.
+.show databases
+
+// Show database metadata and size details.
+.show database MyDatabase details
+
+// Show table-level metadata and size statistics in the current database.
+.show tables details
+
+// Inspect the source table's column names and types.
+.show table Events schema as json
+
+// List currently running queries visible to the caller.
+.show running queries
+
+// Inspect recent queries for latency, CPU, memory, failures, and cache behavior.
+.show queries
+| where StartedOn > ago(1h)
+| project StartedOn, Database, WorkloadGroup, Application, Duration,
+          TotalCpu, MemoryPeak, State, FailureReason, CacheStatistics
+| order by Duration desc
+
+// Inspect recent management operations and asynchronous operation progress.
+.show operations
+
+// Inspect recent ingestion-command failures; use pipeline metrics for other ingestion stages.
+.show ingestion failures
+| where FailedOn > ago(1h)
+| project FailedOn, Database, Table, FailureKind, ErrorCode, Details
+
+// 1.1 Query fanout and resource limits; create the batch group in section 2.1 first.
+
+// Capture the batch group's current policies before changing resource limits.
+.show workload_group ['batch']
+
+// Limit fanout, operator memory, and execution time without replacing unrelated group policies.
+.alter-merge workload_group ['batch']
+@'{
+  "RequestLimitsPolicy": {
+    "MaxFanoutThreadsPercentage": {"IsRelaxable": false, "Value": 50},
+    "MaxFanoutNodesPercentage": {"IsRelaxable": false, "Value": 100},
+    "MaxMemoryPerIterator": {"IsRelaxable": false, "Value": 1073741824},
+    "MaxExecutionTime": {"IsRelaxable": false, "Value": "00:02:00"}
+  }
+}'
+
+// Verify the batch group's updated resource limits.
+.show workload_group ['batch']
+
+// Disable query-results cache reuse for this fanout test.
+set query_results_cache_max_age = time(0s);
+// Request 50 percent thread fanout, subject to workload-group limits.
+set query_fanout_threads_percent = 50;
+// Count recent events per tenant to compare fanout settings under the same load.
+Events
+| where Timestamp > ago(1h)
+| summarize Count = count() by TenantId
+
+// Compare completed test requests by latency, resource use, and request properties.
+.show queries
+| where StartedOn > ago(15m)
+| project StartedOn, WorkloadGroup, Duration, TotalCpu, MemoryPeak,
+          State, FailureReason, ClientRequestProperties
+
+// 1.2 Shuffle parallelism for high-cardinality aggregations and joins.
+
+// Distribute a high-cardinality tenant aggregation using shuffle.
+Events
+| where Timestamp > ago(1d)
+| summarize hint.strategy=shuffle Count = count() by TenantId
+
+// Shuffle a tenant-key join after filtering and projecting the inputs.
+Events
+| where Timestamp > ago(1h)
+| project Timestamp, TenantId, Value
+| join kind=inner hint.shufflekey=TenantId
+    (TenantAttributes | project TenantId, Segment) on TenantId
+
+// 1.3 Union branch parallelism.
+
+// Allow up to four concurrent union subqueries across two nodes, subject to available work and resources.
+union hint.concurrency=4 hint.spread=2
+    (Events | where Timestamp > ago(1h) | project Timestamp, TenantId),
+    (ArchivedEvents | where Timestamp > ago(1h) | project Timestamp, TenantId)
+| summarize Count = count() by TenantId
+
+// 2.1 Workload-group creation and request classification.
+
+// List existing groups so a create-or-alter operation does not accidentally replace a group.
+.show workload_groups
+
+// Create the example batch group with an eight-request cap; replace only if explicitly intended.
+.create-or-alter workload_group ['batch']
+@'{
+  "RequestRateLimitPolicies": [
+    {
+      "IsEnabled": true,
+      "Scope": "WorkloadGroup",
+      "LimitKind": "ConcurrentRequests",
+      "Properties": {"MaxConcurrentRequests": 8}
+    }
+  ]
+}'
+
+// Verify the example batch group's definition.
+.show workload_group ['batch']
+
+// Save the current Eventhouse or cluster request-classification policy.
+.show cluster policy request_classification
+
+// Replace the global classifier with example application routing; preserve real routing rules first.
+.alter cluster policy request_classification '{"IsEnabled":true}' <|
+    case(
+        request_properties.request_type == "Query"
+            and request_properties.current_application == "BatchWorker",
+        "batch",
+        "default"
+    )
+
+// Verify classification rules after the change.
+.show cluster policy request_classification
+
+// Check which groups applications actually reached and their recorded CPU consumption.
+.show queries
+| where StartedOn > ago(15m)
+| summarize Requests = count(), Cpu = sum(TotalCpu)
+    by WorkloadGroup, Application, State
+
+// 2.2 Concurrent-request admission; limits apply at the configured enforcement scope.
+
+// Capture the group's current rate-limit array before replacing its entries.
+.show workload_group ['batch']
+
+// Set group and per-principal concurrency caps; preserve other required rate-limit entries.
+.alter-merge workload_group ['batch']
+@'{
+  "RequestRateLimitPolicies": [
+    {
+      "IsEnabled": true,
+      "Scope": "WorkloadGroup",
+      "LimitKind": "ConcurrentRequests",
+      "Properties": {"MaxConcurrentRequests": 8}
+    },
+    {
+      "IsEnabled": true,
+      "Scope": "Principal",
+      "LimitKind": "ConcurrentRequests",
+      "Properties": {"MaxConcurrentRequests": 4}
+    }
+  ]
+}'
+
+// Verify concurrency caps and their enforcement configuration.
+.show workload_group ['batch']
+
+// 2.3 Short-burst queuing; requires a WorkloadGroup-scoped concurrent-request limit.
+
+// Inspect the group before enabling request queuing.
+.show workload_group ['batch']
+
+// Enable short service-managed queuing instead of immediately rejecting every excess request.
+.alter-merge workload_group ['batch']
+@'{"RequestQueuingPolicy":{"IsEnabled":true}}'
+
+// Verify queuing is enabled without assuming that processing capacity increased.
+.show workload_group ['batch']
+
+// 2.4 Resource budgets and rate-limit enforcement.
+
+// Save existing rate-limit entries before applying the alternative CPU-budget example.
+.show workload_group ['batch']
+
+// Set a per-principal hourly CPU budget and group concurrency cap; replace the rate-limit array.
+.alter-merge workload_group ['batch']
+@'{
+  "RequestRateLimitPolicies": [
+    {
+      "IsEnabled": true,
+      "Scope": "WorkloadGroup",
+      "LimitKind": "ConcurrentRequests",
+      "Properties": {"MaxConcurrentRequests": 8}
+    },
+    {
+      "IsEnabled": true,
+      "Scope": "Principal",
+      "LimitKind": "ResourceUtilization",
+      "Properties": {
+        "ResourceKind": "TotalCpuSeconds",
+        "MaxUtilization": 1000,
+        "TimeWindow": "01:00:00"
+      }
+    }
+  ]
+}'
+
+// Verify the resource-budget entries and other group settings.
+.show workload_group ['batch']
+
+// Inspect current enforcement scope before testing centralized rate-limit enforcement.
+.show workload_group ['batch']
+
+// Centralize query and command admission enforcement; test coordination overhead separately.
+.alter-merge workload_group ['batch']
+@'{
+  "RequestRateLimitsEnforcementPolicy": {
+    "QueriesEnforcementLevel":"Cluster",
+    "CommandsEnforcementLevel":"Cluster"
+  }
+}'
+
+// Verify centralized enforcement scope and effective admission behavior under load.
+.show workload_group ['batch']
+
+// 2.5 Query consistency; use only when temporary metadata/data staleness is acceptable.
+
+// Capture the group's current consistency settings.
+.show workload_group ['batch']
+
+// Require weak consistency for this group, trading immediate freshness for query-head distribution.
+.alter-merge workload_group ['batch']
+@'{
+  "QueryConsistencyPolicy": {
+    "QueryConsistency": {"IsRelaxable": false, "Value": "Weak"}
+  }
+}'
+
+// Verify the group's consistency policy.
+.show workload_group ['batch']
+
+// ADX ONLY: inspect weak-consistency service node-allocation settings.
+.show cluster policy query_weak_consistency
+
+// ADX ONLY: test a support-reviewed weak-consistency node percentage while retaining other settings.
+.alter-merge cluster policy query_weak_consistency
+@'{"PercentageOfNodes":30}'
+
+// ADX ONLY: verify weak-consistency service settings, including existing minimum and maximum nodes.
+.show cluster policy query_weak_consistency
+
+// 3.1 Queued ingestion batching.
+
+// Inspect the database's batching default before changing it.
+.show database MyDatabase policy ingestionbatching
+
+// Inspect any table-level batching override that takes precedence over the database default.
+.show table Events policy ingestionbatching
+
+// Set database batching to five minutes, 500 items, or 1024 MB raw data, whichever seals first.
+.alter database MyDatabase policy ingestionbatching
+@'{
+  "MaximumBatchingTimeSpan":"00:05:00",
+  "MaximumNumberOfItems":500,
+  "MaximumRawDataSizeMB":1024
+}'
+
+// Verify the database batching policy.
+.show database MyDatabase policy ingestionbatching
+
+// Override only this table's batching time to 30 seconds; measure extra small-extent overhead.
+.alter-merge table Events policy ingestionbatching
+@'{"MaximumBatchingTimeSpan":"00:00:30"}'
+
+// Verify the table batching override.
+.show table Events policy ingestionbatching
+
+// 3.2 ADX streaming policy; cluster-level streaming enablement is also required.
+
+// ADX ONLY: inspect the table's streaming-ingestion policy.
+.show table Events policy streamingingestion
+
+// ADX ONLY: enable streaming ingestion for the table without changing the producer's ingestion mode.
+.alter table Events policy streamingingestion '{"IsEnabled":true}'
+
+// ADX ONLY: verify the table streaming policy.
+.show table Events policy streamingingestion
+
+// 3.3 ADX ingestion capacity; tune only with measured slot saturation and resource headroom.
+
+// ADX ONLY: save the cluster's current data-management capacity policy.
+.show cluster policy capacity
+
+// ADX ONLY: inspect total, consumed, and remaining effective ingestion operation slots.
+.show capacity ingestions
+
+// ADX ONLY: change the ingestion slot cap and core coefficient without resetting other components.
+.alter-merge cluster policy capacity
+@'{
+  "IngestionCapacity": {
+    "ClusterMaximumConcurrentOperations":128,
+    "CoreUtilizationCoefficient":0.5
+  }
+}'
+
+// ADX ONLY: verify the configured ingestion capacity settings.
+.show cluster policy capacity
+
+// ADX ONLY: verify effective ingestion slots after policy propagation.
+.show capacity ingestions
+
+// 3.4 ADX background-operation capacity.
+
+// ADX ONLY: capture the capacity policy before changing materialization concurrency.
+.show cluster policy capacity
+
+// ADX ONLY: inspect effective materialized-view operation capacity.
+.show capacity materialized-view
+
+// ADX ONLY: set materialization concurrency bounds; raising the minimum can exhaust resources.
+.alter-merge cluster policy capacity
+@'{
+  "MaterializedViewsCapacity": {
+    "ClusterMinimumConcurrentOperations":2,
+    "ClusterMaximumConcurrentOperations":10
+  }
+}'
+
+// ADX ONLY: verify configured materialization capacity bounds.
+.show cluster policy capacity
+
+// ADX ONLY: inspect effective materialization concurrency after propagation.
+.show capacity materialized-view
+
+// ADX ONLY: capture current capacity settings before an export-concurrency change.
+.show cluster policy capacity
+
+// ADX ONLY: inspect effective export operation capacity.
+.show capacity data-export
+
+// ADX ONLY: change the export operation cap while retaining the existing core coefficient.
+.alter-merge cluster policy capacity
+@'{"ExportCapacity":{"ClusterMaximumConcurrentOperations":16}}'
+
+// ADX ONLY: verify the configured export cap.
+.show cluster policy capacity
+
+// ADX ONLY: inspect effective export capacity after propagation.
+.show capacity data-export
+
+// ADX ONLY: inspect maintenance capacity settings before diagnosing background backlogs.
+.show cluster policy capacity
+
+// ADX ONLY: inspect effective extent-partitioning operation slots.
+.show capacity extents-partition
+
+// ADX ONLY: inspect effective extent-merge operation slots before considering support-reviewed changes.
+.show capacity extents-merge
+
+// 3.5 Ingestion timestamps for diagnostics, not throughput acceleration.
+
+// Inspect whether approximate ingestion timestamps are recorded for the table.
+.show table Events policy ingestiontime
+
+// Enable ingestion timestamp recording for subsequently ingested records.
+.alter table Events policy ingestiontime true
+
+// Verify the ingestion-time policy.
+.show table Events policy ingestiontime
+
+// 4.1 Hot-data cache sizing; table overrides take precedence.
+
+// Inspect the database hot-cache default.
+.show database MyDatabase policy caching
+
+// Set the database hot-cache window to seven days without adding physical cache capacity.
+.alter database MyDatabase policy caching hot = 7d
+
+// Verify the database caching policy.
+.show database MyDatabase policy caching
+
+// Inspect the table caching policy before adding or replacing an override.
+.show table Events policy caching
+
+// Set a three-day hot-cache window for this table independently of the database default.
+.alter table Events policy caching hot = 3d
+
+// Verify the table caching override.
+.show table Events policy caching
+
+// 4.2 Retention; obtain data-owner approval because shortening retention can remove data.
+
+// Capture the database retention policy before changing data lifecycle settings.
+.show database MyDatabase policy retention
+
+// Set database retention to 90 days with recoverability enabled.
+.alter-merge database MyDatabase policy retention
+    softdelete = 90d recoverability = enabled
+
+// Verify the database retention policy.
+.show database MyDatabase policy retention
+
+// Capture the table's retention override before changing it.
+.show table Events policy retention
+
+// Set table retention to 30 days with recoverability enabled; deleted data is not restored by rollback.
+.alter-merge table Events policy retention
+    softdelete = 30d recoverability = enabled
+
+// Verify the table retention override.
+.show table Events policy retention
+
+// 4.3 Partitioning; most tables do not need an explicit policy.
+
+// Capture the table's existing partitioning policy.
+.show table Events policy partitioning
+
+// Hash-partition a sufficiently large tenant-filtered table; expect background rewrite cost.
+.alter table Events policy partitioning
+@'{
+  "PartitionKeys": [
+    {
+      "ColumnName":"TenantId",
+      "Kind":"Hash",
+      "Properties": {
+        "Function":"XxHash64",
+        "MaxPartitionCount":128,
+        "PartitionAssignmentMode":"Uniform"
+      }
+    }
+  ]
+}'
+
+// Verify partitioning configuration before measuring rewrite cost and query benefit.
+.show table Events policy partitioning
+
+// 4.4 Row order and extent merging.
+
+// Inspect the table's existing physical row-order policy.
+.show table Events policy roworder
+
+// Order rows within extents by tenant then descending timestamp; do not duplicate a hash partition key.
+.alter table Events policy roworder (TenantId asc, Timestamp desc)
+
+// Verify row-order configuration without assuming query output is sorted.
+.show table Events policy roworder
+
+// Inspect table-level sizes and counts before considering expensive extent enumeration.
+.show table Events details
+
+// Enumerate table extents for fragmentation diagnostics only when shard-level inspection is needed.
+.show table Events extents
+| summarize Extents = count(),
+            Rows = sum(RowCount),
+            OriginalBytes = sum(OriginalSize),
+            ExtentBytes = sum(ExtentSize)
+
+// Capture the existing merge policy before a support-reviewed adjustment.
+.show table Events policy merge
+
+// Inspect retention to derive a suitable merge range.
+.show table Events policy retention
+
+// Inspect caching because the smaller retention/cache duration drives merge-range guidance.
+.show table Events policy caching
+
+// Support-reviewed alternative: use an 18-hour merge range only when the effective minimum is 30 days.
+.alter-merge table Events policy merge '{"MaxRangeInHours":18}'
+
+// Verify the merge range; the preceding three-day cache example does not justify this setting.
+.show table Events policy merge
+
+// 4.5 Materialized views; this example requires a new, unused view name.
+
+// List materialized views before creating the example aggregation.
+.show materialized-views
+
+// Create incremental daily tenant counts from future ingestion only, with no historical backfill.
+.create materialized-view EventsDaily on table Events
+{
+    Events
+    | summarize EventCount = count() by TenantId, bin(Timestamp, 1d)
+}
+
+// Inspect view definition, enabled state, health, materialization progress, and last-run result.
+.show materialized-view EventsDaily
+
+// Inspect the materialized view's own caching policy.
+.show materialized-view EventsDaily policy caching
+
+// Keep seven days of the view's materialized portion hot; source-delta caching remains independent.
+.alter materialized-view EventsDaily policy caching hot = 7d
+
+// Verify the materialized-view caching policy.
+.show materialized-view EventsDaily policy caching
+
+// 4.6 Update policies; source and target must exist in the same database with matching schemas.
+
+// Inspect target schema names, types, and column order before attaching an update policy.
+.show table CuratedEvents schema as json
+
+// Save every existing target update-policy entry because the following alter replaces the array.
+.show table CuratedEvents policy update
+
+// Verify the source columns used by the transformation.
+.show table Events schema as json
+
+// Replace the target's policy with a transactional projection; preserve other required entries first.
+.alter table CuratedEvents policy update
+@'[
+  {
+    "IsEnabled":true,
+    "Source":"Events",
+    "Query":"Events | project Timestamp, TenantId, Value",
+    "IsTransactional":true,
+    "PropagateIngestionProperties":false
+  }
+]'
+
+// Verify the update policy and separately test ingestion success and derived-data correctness.
+.show table CuratedEvents policy update
+
+// 4.7 Results caching; run the exact query twice to test cache reuse.
+
+// Inspect database query-results cache counters before testing.
+.show database cache query_results
+
+// Allow this query to reuse results up to one minute old.
+set query_results_cache_max_age = time(1m);
+// Count recent events by tenant using eligible cached results when available.
+Events
+| where Timestamp > ago(1h)
+| summarize EventCount = count() by TenantId
+
+// Inspect cache counters after testing and use response ServerCache properties to confirm a specific hit.
+.show database cache query_results
+
+// Capture the batch group's current results-cache defaults.
+.show workload_group ['batch']
+
+// Set a relaxable one-minute cached-results age for the group.
+.alter-merge workload_group ['batch']
+@'{
+  "QueryConsistencyPolicy": {
+    "CachedResultsMaxAge": {"IsRelaxable":true,"Value":"00:01:00"}
+  }
+}'
+
+// Verify the group's results-cache default without changing its other consistency options.
+.show workload_group ['batch']
+
+// 5. Load-test measurements; client-side latency and upstream rejections require separate telemetry.
+
+// Summarize visible LoadTest query latency, CPU, memory, and failures in five-minute windows.
+.show queries
+| where StartedOn > ago(1h) and Application == "LoadTest"
+| extend DurationMs = Duration / 1ms, CpuSeconds = TotalCpu / 1s
+| summarize Requests = count(),
+            Failed = countif(State != "Completed"),
+            P50Ms = percentile(DurationMs, 50),
+            P95Ms = percentile(DurationMs, 95),
+            P99Ms = percentile(DurationMs, 99),
+            CpuSeconds = sum(CpuSeconds),
+            PeakMemoryBytes = max(MemoryPeak)
+    by WorkloadGroup, bin(StartedOn, 5m)
+| order by StartedOn asc

@@ -285,6 +285,103 @@ union hint.concurrency=4 hint.spread=2
 // ADX ONLY: verify the table streaming policy.
 .show table Events policy streamingingestion
 
+// 3.2.1 Streaming baseline; run these commands against the APPLICATION Eventhouse/database.
+
+// Inspect per-table streaming statistic buckets, statuses, request sizes, and engine write durations.
+.show streamingingestion statistics
+| where Database == "MyDatabase" and Table == "Events"
+| where StartTime > ago(1h)
+| project StartTime, EndTime, IngestionStatus, Count,
+          AvgDuration, MinDuration, MaxDuration,
+          TotalDataSize, TotalRowCount, MinRowCount, MaxRowCount,
+          NumOfRowStoresReferences
+| order by StartTime asc
+
+// Compare request-count-weighted engine write duration by status without averaging bucket means equally.
+.show streamingingestion statistics
+| where Database == "MyDatabase" and Table == "Events"
+| where StartTime > ago(1h)
+| extend BucketDurationMs = AvgDuration / 1ms
+| summarize Requests = sum(Count),
+            WeightedDurationMs = sum(BucketDurationMs * Count),
+            Bytes = sum(TotalDataSize), Rows = sum(TotalRowCount),
+            FirstObserved = min(StartTime), LastObserved = max(EndTime)
+    by IngestionStatus, bin(StartTime, 5m)
+| extend AverageWriteMs = iff(Requests > 0, WeightedDurationMs / Requests, real(null))
+| order by StartTime asc
+
+// 3.2.2 ADX ONLY streaming rate hint; example GB/hour is not a latency or flush-time setting.
+
+// ADX ONLY: inspect inherited database streaming policy before overriding the table.
+.show database MyDatabase policy streamingingestion
+
+// ADX ONLY: capture the table's existing streaming policy for rollback.
+.show table Events policy streamingingestion
+
+// ADX ONLY: test a measured hourly-volume hint while retaining unrelated streaming-policy properties.
+.alter-merge table Events policy streamingingestion
+    '{"IsEnabled":true,"HintAllocatedRate":1.5}'
+
+// ADX ONLY: verify the streaming rate hint before rerunning a comparable workload.
+.show table Events policy streamingingestion
+
+// 3.2.3 Completed row-store sealing and competing features; application database context.
+
+// Compare completed RowStoreSeal cost over time without claiming it measures request write latency.
+.show data operations
+| where Database == "MyDatabase" and Table == "Events"
+| where OperationKind == "RowStoreSeal" and Timestamp > ago(1h)
+| summarize Seals = count(), AverageSealDuration = avg(Duration),
+            MaximumSealDuration = max(Duration), CpuSeconds = sum(TotalCpu / 1s),
+            Rows = sum(RowCount), ExtentBytes = sum(ExtentSize)
+    by bin(Timestamp, 5m)
+| order by Timestamp asc
+
+// Inspect update policies on this target table; inspect known derived targets separately.
+.show table Events policy update
+
+// Inspect background partitioning work that can compete with ingestion.
+.show table Events policy partitioning
+
+// Inspect hot-cache scope before attributing write latency to cache pressure.
+.show table Events policy caching
+
+// Inspect enabled views over the source table and their materialization progress.
+.show materialized-views
+| where SourceTable == "Events"
+| project Name, SourceTable, IsEnabled, IsHealthy, MaterializedTo, LastRunResult
+
+// 3.2.4 SWITCH TO MONITORING DATABASE: these queries do not target the application database.
+
+// Inspect the public metric schema before comparing streaming-duration observations.
+.show table EventhouseMetrics schema as json
+
+// Compare weighted streaming-duration averages and singleton coverage for the selected Eventhouse.
+let targetEventhouseId = "<eventhouse-item-id>";
+EventhouseMetrics
+| where Timestamp > ago(1h) and ItemId == targetEventhouseId
+| where MetricName == "StreamingIngestDuration"
+| summarize MetricRecords = count(), Samples = sum(MetricCount),
+            DurationSumMs = sum(MetricSumValue),
+            SingletonRecords = countif(MetricCount == 1)
+    by WorkspaceId, ItemId, bin(Timestamp, 5m)
+| extend AverageWriteMs = iff(Samples > 0, todouble(DurationSumMs) / Samples, real(null))
+| order by Timestamp asc
+
+// Calculate percentiles only for singleton metric records; excluded aggregates limit workload coverage.
+let targetEventhouseId = "<eventhouse-item-id>";
+EventhouseMetrics
+| where Timestamp > ago(1h) and ItemId == targetEventhouseId
+| where MetricName == "StreamingIngestDuration" and MetricCount == 1
+| summarize SingletonSamples = count(),
+            P50Ms = percentile(MetricSumValue, 50),
+            P95Ms = percentile(MetricSumValue, 95),
+            Under200Ms = countif(MetricSumValue < 200)
+    by WorkspaceId, ItemId, bin(Timestamp, 5m)
+| extend Under200Pct = 100.0 * Under200Ms / SingletonSamples
+| order by Timestamp asc
+
+// SWITCH BACK TO APPLICATION EVENTHOUSE for the remaining management commands.
 // 3.3 ADX ingestion capacity; tune only with measured slot saturation and resource headroom.
 
 // ADX ONLY: save the cluster's current data-management capacity policy.
