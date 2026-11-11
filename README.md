@@ -1,9 +1,9 @@
 # FabricOps
 
-FabricOps is a personal test repository for Microsoft Fabric code, deployment
+FabricOps is a personal repository for Microsoft Fabric code, deployment
 patterns, and proof-of-concept workloads.
 
-The projects are intended for learning and experimentation. Review resource
+The projects are intended for documenting new concepts and documentations. Review resource
 names, capacities, credentials, retention settings, and cost implications before
 using them outside a development environment.
 
